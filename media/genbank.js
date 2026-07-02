@@ -973,28 +973,36 @@ module.exports = {
       const isMerged = genbankParams.http_genbank_merged === 'true' ||
                        genbankParams.http_genbank_merged === true
 
-      // Collect genome IDs to process
+      // Collect genome IDs to process.
+      // In streaming mode (http_download=true), res.results has { stream }
+      // instead of { response: { docs } }, so we consume the stream.
       let genomeIds = []
+      const results = await Promise.resolve(res.results)
 
-      if (req.call_collection === 'genome') {
-        // For genome collection queries, process ALL genomes in result
-        if (res.results?.response?.docs && res.results.response.docs.length > 0) {
-          genomeIds = res.results.response.docs
-            .map(doc => doc.genome_id)
-            .filter(id => id)
-        } else if (req.call_params?.[1]) {
-          // Direct ID lookup
-          genomeIds = [req.call_params[1]]
-        }
-      } else if (req.call_collection === 'genome_feature' || req.call_collection === 'genome_sequence') {
-        // For feature/sequence queries, get unique genome_id from first result
-        if (res.results?.response?.docs?.[0]?.genome_id) {
-          genomeIds = [res.results.response.docs[0].genome_id]
-        }
+      if (results?.response?.docs && results.response.docs.length > 0) {
+        genomeIds = results.response.docs
+          .map(doc => doc.genome_id)
+          .filter(id => id)
+        genomeIds = [...new Set(genomeIds)]
+      } else if (results?.stream) {
+        genomeIds = await new Promise((resolve, reject) => {
+          const ids = new Set()
+          let isHeader = true
+          results.stream.on('data', (doc) => {
+            if (isHeader) { isHeader = false; return }
+            if (doc && doc.genome_id) { ids.add(doc.genome_id) }
+          })
+          results.stream.on('end', () => resolve([...ids]))
+          results.stream.on('error', reject)
+        })
+      } else if (req.call_params?.[1]) {
+        genomeIds = [req.call_params[1]]
       }
 
       if (genomeIds.length === 0) {
-        res.status(400).send('Genome ID is required for Genbank export')
+        if (!res.headersSent) {
+          res.status(400).send('Genome ID is required for Genbank export')
+        }
         return
       }
 
