@@ -171,6 +171,11 @@ function shouldUseDistributedQuery (req, config) {
     }
   }
 
+  // Only applies to query and stream methods
+  if (req.call_method !== 'query' && req.call_method !== 'stream') {
+    return { useDistributed: false, reason: `method ${req.call_method} not supported` }
+  }
+
   // Check for query param override
   const query = req.call_params[0] || ''
   const distributedParam = query.match(/(?:^|[&?])distributed=(true|false|1|0)/)
@@ -180,11 +185,6 @@ function shouldUseDistributedQuery (req, config) {
       useDistributed: useIt,
       reason: useIt ? 'query param override (enabled)' : 'query param override (disabled)'
     }
-  }
-
-  // Only applies to query and stream methods
-  if (req.call_method !== 'query' && req.call_method !== 'stream') {
-    return { useDistributed: false, reason: `method ${req.call_method} not supported` }
   }
 
   const collection = req.call_collection
