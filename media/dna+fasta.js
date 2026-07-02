@@ -366,9 +366,15 @@ async function serializeFeatureStreamLegacy (stream, res, req) {
 /**
  * Serialize genome_sequence stream (no join needed, sequences are inline).
  */
-async function serializeGenomeSequenceStream (stream, res) {
+async function serializeGenomeSequenceStream (stream, res, req) {
+  const headerFormatter = createFastaHeaderFormatterFromRequest(req)
+
   await streamWithBackpressure(stream, res, {
-    transform: (doc) => formatGenomeSequenceRecord(doc)
+    transform: (doc) => {
+      const header = headerFormatter(doc)
+      const sequence = doc.sequence ? LineWrap(doc.sequence, 60) : ''
+      return header + sequence + '\n'
+    }
   })
 }
 
@@ -454,8 +460,11 @@ async function serializeQueryResults (docs, res, req) {
       }
     }
   } else if (collection === 'genome_sequence') {
+    const headerFormatter = createFastaHeaderFormatterFromRequest(req)
     for (const doc of docs) {
-      res.write(formatGenomeSequenceRecord(doc))
+      const header = headerFormatter(doc)
+      const sequence = doc.sequence ? LineWrap(doc.sequence, 60) : ''
+      res.write(header + sequence + '\n')
     }
   }
 }
@@ -490,7 +499,7 @@ module.exports = {
             await serializeFeatureStreamLegacy(results.stream, res, req)
           }
         } else if (collection === 'genome_sequence') {
-          await serializeGenomeSequenceStream(results.stream, res)
+          await serializeGenomeSequenceStream(results.stream, res, req)
         } else {
           // Unknown collection, just end
           res.end()

@@ -343,6 +343,27 @@ module.exports = async function distributedQueryMiddleware (req, res, next) {
     // Wrap the result for media handler compatibility
     res.results = wrapForMediaHandler(queryResult, 'stream')
 
+    // Pipe through join enrichment stream if join specs were prepared
+    if (req._joinSpecs && req._joinSpecs.length > 0 && res.results.stream) {
+      try {
+        const JoinEnrichmentStream = require('../lib/distributed/JoinEnrichmentStream')
+        const { getJoiner } = require('./JoinEnrichment')
+        const joiner = await getJoiner()
+
+        const joinStream = new JoinEnrichmentStream(joiner, {
+          joinSpecs: req._joinSpecs,
+          batchSize: 50,
+          skipHeader: false // wrapForMediaHandler already handles header
+        })
+
+        res.results.stream = res.results.stream.pipe(joinStream)
+        debug(`Piped distributed query through JoinEnrichmentStream: ${req._joinSpecs.map(s => s.fields.join(',')).join('; ')}`)
+      } catch (err) {
+        // Don't fail the request — just skip enrichment
+        debug(`Failed to set up stream join enrichment: ${err.message}`)
+      }
+    }
+
     // Set flag to skip APIMethodHandler
     req.skipAPIMethodHandler = true
 

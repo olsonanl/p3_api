@@ -153,12 +153,46 @@ function injectFieldsIntoQuery (query, keysToInject) {
 }
 
 /**
+ * Build join specifications from requested fields and collection config.
+ * Groups fields by their target collection to minimize lookups.
+ *
+ * @param {Array<string>} requestedJoinFields - Field names that were requested
+ * @param {Object} joinableFields - Collection's joinable field configuration
+ * @returns {Array<Object>} Array of join specifications
+ */
+function buildJoinSpecs (requestedJoinFields, joinableFields) {
+  const groups = new Map()
+
+  for (const fieldName of requestedJoinFields) {
+    const fieldConfig = joinableFields[fieldName]
+    if (!fieldConfig) continue
+
+    const groupKey = `${fieldConfig.from}:${fieldConfig.via}`
+
+    if (!groups.has(groupKey)) {
+      groups.set(groupKey, {
+        targetCollection: fieldConfig.from,
+        localField: fieldConfig.via,
+        foreignField: fieldConfig.via,
+        fields: []
+      })
+    }
+
+    groups.get(groupKey).fields.push(fieldConfig.field)
+  }
+
+  return Array.from(groups.values())
+}
+
+/**
  * JoinFieldInjector Middleware
  *
  * Modifies the query to include join key fields when joinable fields are requested.
+ * Also stores join specifications on the request object for downstream middleware
+ * (JoinEnrichment for paginated queries, JoinEnrichmentStream for streaming).
  */
 function joinFieldInjectorMiddleware (req, res, next) {
-  // Only process query method
+  // Only process query methods (both paginated and streaming)
   if (req.call_method !== 'query') {
     return next()
   }
@@ -183,6 +217,13 @@ function joinFieldInjectorMiddleware (req, res, next) {
 
   if (requestedJoinFields.length === 0) {
     return next()
+  }
+
+  // Build join specs and store on request for downstream middleware
+  const joinSpecs = buildJoinSpecs(requestedJoinFields, collectionConfig.joinableFields)
+  if (joinSpecs.length > 0) {
+    req._joinSpecs = joinSpecs
+    debug(`Join specs prepared for ${req.call_collection}: ${joinSpecs.map(s => s.fields.join(',')).join('; ')}`)
   }
 
   // Get the join key fields we need to inject
