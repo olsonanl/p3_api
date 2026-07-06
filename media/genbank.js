@@ -318,9 +318,33 @@ function formatOrigin (sequence) {
 }
 
 /**
- * Write Genbank record header (LOCUS through FEATURES line)
+ * Write a chunk to the response, honoring backpressure. Resolves immediately if
+ * the internal buffer has room, otherwise waits for 'drain' (or client 'close').
+ * Without this, GenBank's many small writes accumulate unbounded in the Node
+ * heap whenever the client/network drains slower than we generate — which on a
+ * large multi-genome export leads to GC thrashing and multi-minute stalls.
  */
-function writeRecordHeader (res, genome, contig) {
+function writeChunk (res, chunk) {
+  return new Promise((resolve) => {
+    if (res.write(chunk)) {
+      resolve()
+      return
+    }
+    const onDrain = () => { cleanup(); resolve() }
+    const onClose = () => { cleanup(); resolve() }
+    const cleanup = () => {
+      res.removeListener('drain', onDrain)
+      res.removeListener('close', onClose)
+    }
+    res.once('drain', onDrain)
+    res.once('close', onClose)
+  })
+}
+
+/**
+ * Build the Genbank record header (LOCUS through FEATURES line) as a string.
+ */
+function buildRecordHeader (genome, contig) {
   const seqLength = contig.length || contig.sequence?.length || 0
   const accession = contig.accession || contig.sequence_id || 'unknown'
   const topology = contig.topology || 'linear'
@@ -328,131 +352,135 @@ function writeRecordHeader (res, genome, contig) {
   const division = 'BCT'
   const date = formatGenbankDate(contig.release_date || genome.completion_date)
 
+  const lines = []
+
   // LOCUS line — pad to 16 for alignment but do not truncate longer names
   const locusName = accession.padEnd(16)
   const lengthStr = String(seqLength).padStart(11) + ' bp'
   const molStr = moleculeType.padStart(7)
   const topoStr = topology.padEnd(8)
-  res.write(`LOCUS       ${locusName} ${lengthStr}    ${molStr}     ${topoStr} ${division} ${date}\n`)
+  lines.push(`LOCUS       ${locusName} ${lengthStr}    ${molStr}     ${topoStr} ${division} ${date}`)
 
   // DEFINITION
   const definition = contig.description || `${genome.genome_name || genome.organism_name} ${accession}`
-  res.write(`DEFINITION  ${wrapText(definition, 12)}\n`)
+  lines.push(`DEFINITION  ${wrapText(definition, 12)}`)
 
   // ACCESSION
-  res.write(`ACCESSION   ${accession}\n`)
+  lines.push(`ACCESSION   ${accession}`)
 
   // VERSION
   const version = contig.version ? `${accession}.${contig.version}` : accession
-  res.write(`VERSION     ${version}\n`)
+  lines.push(`VERSION     ${version}`)
 
   // DBLINK
   if (genome.bioproject_accession || genome.biosample_accession || genome.genome_id) {
     let firstDblink = true
     if (genome.bioproject_accession) {
-      res.write(`DBLINK      BioProject: ${genome.bioproject_accession}\n`)
+      lines.push(`DBLINK      BioProject: ${genome.bioproject_accession}`)
       firstDblink = false
     }
     if (genome.biosample_accession) {
-      res.write(`${firstDblink ? 'DBLINK      ' : '            '}BioSample: ${genome.biosample_accession}\n`)
+      lines.push(`${firstDblink ? 'DBLINK      ' : '            '}BioSample: ${genome.biosample_accession}`)
       firstDblink = false
     }
     if (genome.genome_id) {
-      res.write(`${firstDblink ? 'DBLINK      ' : '            '}BV-BRC: ${genome.genome_id}\n`)
+      lines.push(`${firstDblink ? 'DBLINK      ' : '            '}BV-BRC: ${genome.genome_id}`)
     }
   }
 
   // KEYWORDS
-  res.write('KEYWORDS    .\n')
+  lines.push('KEYWORDS    .')
 
   // SOURCE
   const organism = genome.genome_name || genome.organism_name || 'Unknown organism'
-  res.write(`SOURCE      ${organism}\n`)
-  res.write(`  ORGANISM  ${organism}\n`)
+  lines.push(`SOURCE      ${organism}`)
+  lines.push(`  ORGANISM  ${organism}`)
 
   // Taxonomy lineage
   if (genome.taxon_lineage_names) {
     const lineage = Array.isArray(genome.taxon_lineage_names)
       ? genome.taxon_lineage_names.join('; ')
       : genome.taxon_lineage_names
-    res.write(`            ${wrapText(lineage + '.', 12)}\n`)
+    lines.push(`            ${wrapText(lineage + '.', 12)}`)
   }
 
   // REFERENCE
-  res.write('REFERENCE   1  (bases 1 to ' + seqLength + ')\n')
-  res.write('  AUTHORS   BV-BRC.\n')
-  res.write('  TITLE     Direct Submission\n')
-  res.write('  JOURNAL   Exported from BV-BRC (https://www.bv-brc.org/)\n')
+  lines.push('REFERENCE   1  (bases 1 to ' + seqLength + ')')
+  lines.push('  AUTHORS   BV-BRC.')
+  lines.push('  TITLE     Direct Submission')
+  lines.push('  JOURNAL   Exported from BV-BRC (https://www.bv-brc.org/)')
 
   // COMMENT
   if (genome.comments) {
-    res.write(`COMMENT     ${wrapText(genome.comments, 12)}\n`)
+    lines.push(`COMMENT     ${wrapText(genome.comments, 12)}`)
   }
 
   // FEATURES header
-  res.write('FEATURES             Location/Qualifiers\n')
+  lines.push('FEATURES             Location/Qualifiers')
 
   // Source feature
-  res.write(`     source          1..${seqLength}\n`)
-  res.write(`                     /organism="${organism}"\n`)
-  res.write(`                     /mol_type="genomic DNA"\n`)
+  lines.push(`     source          1..${seqLength}`)
+  lines.push(`                     /organism="${organism}"`)
+  lines.push(`                     /mol_type="genomic DNA"`)
   if (genome.strain) {
-    res.write(`                     /strain="${genome.strain}"\n`)
+    lines.push(`                     /strain="${genome.strain}"`)
   }
   if (genome.taxon_id) {
-    res.write(`                     /db_xref="taxon:${genome.taxon_id}"\n`)
+    lines.push(`                     /db_xref="taxon:${genome.taxon_id}"`)
   }
   if (genome.genome_id) {
-    res.write(`                     /db_xref="BV-BRC:${genome.genome_id}"\n`)
+    lines.push(`                     /db_xref="BV-BRC:${genome.genome_id}"`)
   }
+
+  return lines.join('\n') + '\n'
 }
 
 /**
- * Write pre-fetched features (already scoped to one contig) to the response,
+ * Build pre-fetched features (already scoped to one contig) as a string,
  * ordered by start coordinate.
  */
-function writeFeaturesForContig (res, features) {
+function buildFeaturesForContig (features) {
   const sorted = features.slice().sort((a, b) => (a.start || 0) - (b.start || 0))
+  let out = ''
   for (const feature of sorted) {
     const gbType = mapFeatureType(feature.feature_type)
-    res.write(formatFeature(feature, gbType) + '\n')
+    out += formatFeature(feature, gbType) + '\n'
   }
-  return sorted.length
+  return { text: out, count: sorted.length }
 }
 
 /**
- * Write ORIGIN section with sequence
+ * Build the ORIGIN section with sequence as a string.
  */
-function writeOrigin (res, sequence) {
+function buildOrigin (sequence) {
   if (sequence) {
-    res.write(formatOrigin(sequence) + '\n')
-  } else {
-    res.write('ORIGIN\n//\n')
+    return formatOrigin(sequence) + '\n'
   }
+  return 'ORIGIN\n//\n'
 }
 
 /**
  * Write all GenBank records for one genome from pre-fetched data (multi-record
- * mode). Pure synchronous formatting — no Solr I/O — so callers can overlap the
- * fetch of the next genome with writing this one.
+ * mode). Formatting is synchronous (no Solr I/O), but writes honor backpressure
+ * per contig so memory stays bounded on slow clients.
  */
-function writeGenbankMultiRecord (res, genome, contigs, featuresByAccession) {
+async function writeGenbankMultiRecord (res, genome, contigs, featuresByAccession) {
   let contigCount = 0
 
   for (const contig of contigs) {
     const accession = contig.accession || contig.sequence_id
 
-    if (contigCount > 0) {
-      res.write('\n')
-    }
-
-    writeRecordHeader(res, genome, contig)
+    let record = contigCount > 0 ? '\n' : ''
+    record += buildRecordHeader(genome, contig)
 
     const features = featuresByAccession[accession] || []
-    writeFeaturesForContig(res, features)
-    debug(`Wrote ${features.length} features for contig ${accession}`)
+    const built = buildFeaturesForContig(features)
+    record += built.text
+    debug(`Wrote ${built.count} features for contig ${accession}`)
 
-    writeOrigin(res, contig.sequence)
+    record += buildOrigin(contig.sequence)
+
+    await writeChunk(res, record)
     contigCount++
   }
 
@@ -707,6 +735,12 @@ module.exports = {
       res.attachment(`BVBRC_${req.call_collection}.gbk`)
     }
 
+    // Disable nginx proxy buffering so res.write() backpressure reflects the
+    // real client drain rate end-to-end (otherwise nginx buffers unboundedly).
+    if (res.set) {
+      res.set('X-Accel-Buffering', 'no')
+    }
+
     try {
       // Check if merged format is requested
       const genbankParams = req.genbankParams || {}
@@ -777,7 +811,7 @@ module.exports = {
         // Add newline separator between genomes (records within a genome are
         // already separated). Only emitted once we know this genome has output.
         if (!isFirstGenome) {
-          res.write('\n')
+          await writeChunk(res, '\n')
         }
         isFirstGenome = false
 
@@ -785,12 +819,12 @@ module.exports = {
           // Merged mode: concatenate all contigs into a single record
           debug(`Generating merged Genbank record for genome ${genomeId}`)
           const record = generateMergedGenbankRecord(genome, contigs, featuresByAccession)
-          res.write(record)
+          await writeChunk(res, record)
           totalContigs++
         } else {
           // Multi-record mode: one record per contig
           debug(`Writing Genbank records for genome ${genomeId}`)
-          const contigCount = writeGenbankMultiRecord(res, genome, contigs, featuresByAccession)
+          const contigCount = await writeGenbankMultiRecord(res, genome, contigs, featuresByAccession)
           totalContigs += contigCount
         }
       }
