@@ -328,8 +328,8 @@ function writeRecordHeader (res, genome, contig) {
   const division = 'BCT'
   const date = formatGenbankDate(contig.release_date || genome.completion_date)
 
-  // LOCUS line
-  const locusName = accession.substring(0, 16).padEnd(16)
+  // LOCUS line — pad to 16 for alignment but do not truncate longer names
+  const locusName = accession.padEnd(16)
   const lengthStr = String(seqLength).padStart(11) + ' bp'
   const molStr = moleculeType.padStart(7)
   const topoStr = topology.padEnd(8)
@@ -590,8 +590,8 @@ function generateGenbankRecord (genome, contig, features) {
   const division = 'BCT'
   const date = formatGenbankDate(contig.release_date || genome.completion_date)
 
-  // LOCUS line
-  const locusName = accession.substring(0, 16).padEnd(16)
+  // LOCUS line — pad to 16 for alignment but do not truncate longer names
+  const locusName = accession.padEnd(16)
   const lengthStr = String(seqLength).padStart(11) + ' bp'
   const molStr = moleculeType.padStart(7)
   const topoStr = topology.padEnd(8)
