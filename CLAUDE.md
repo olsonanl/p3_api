@@ -27,6 +27,7 @@ npm run test-permissions   # Permission tests
 npm run test-media         # Media format tests
 npm run test-rpc           # RPC tests
 npm run test-distributed   # Distributed query tests
+npx mocha tests/test-security/  # Security tests (SSRF, path traversal)
 
 # Run a single test file
 npx mocha tests/test-api/test.datatype.spec.js
@@ -71,8 +72,11 @@ npm run build-image
   - `ExtractCustomFields.js` - Handles custom field extraction
 
 - **media/** - Response serializers by content type
-  - JSON, CSV, TSV, Excel, FASTA (DNA/protein), GFF, Newick
+  - JSON, CSV, TSV, Excel, FASTA (DNA/protein), GFF, Newick, GenBank
   - Auto-registered from filenames in `media/index.js`
+  - GenBank serializer (`genbank.js`) handles both query and streaming modes — extracts genome_ids from results, then fetches contigs/features per genome via direct Solr queries using the standard `Solrjs` client (not `DirectSolrClient` — see design note below)
+  - FASTA serializers (`dna+fasta.js`, `protein+fasta.js`) use `DirectSolrClient` + `SequenceJoinStream` for efficient sequence lookups with prefetch batching
+  - **Design note — GenBank uses Solrjs, not DirectSolrClient**: GenBank's secondary fetches (genome metadata, contigs, features) are small targeted queries scoped to a single `genome_id`. They don't benefit from `DirectSolrClient`'s parallel shard fan-out, and `DirectSolrClient` requires `SolrClusterClient` for replica discovery which needs direct network access to every Solr replica. Using the standard `Solrjs` client (same as `APIMethodHandler`) means GenBank works through any Solr proxy URL — including on offsite laptops without VPN access to the on-prem cluster. FASTA serializers use `DirectSolrClient` because they join large streaming result sets with sequence data, where direct replica access and batched prefetch are worth the complexity.
 
 - **routes/** - Express routers
   - `dataType.js` - Main `/:dataType/` endpoints (query, get, schema)
@@ -167,10 +171,29 @@ The distributed query system requires direct network access to all Solr shard re
 
 ## Security Notes
 
-Recent XSS fixes documented in `SECURITY_FIX.md`:
-- Parameter name validation in `http-params.js`
-- Error message sanitization in `RQLQueryParser.js`
-- Security headers (CSP, X-Frame-Options, etc.) in `app.js`
+### SolrQuerySanitizer (`middleware/SolrQuerySanitizer.js`)
+
+Blocks dangerous Solr parameters (`shards`, `stream.url`, `stream.file`, `stream.body`, `qt`, `debug`, `debugquery`, `echoparams`, `collection`, `_route_`, `shards.*`) from reaching Solr. Prevents SSRF, file access, and information disclosure.
+
+Key design decisions:
+- **Recursive full decode**: `fullyDecode()` repeatedly applies `decodeURIComponent` (up to 10 iterations) before scanning. Catches double-encoded (`%2526`), triple-encoded (`%252526`), and deeper encoding attacks where `%26` becomes `&` at Solr's decoding layer, creating smuggled parameters.
+- **Full-string scan**: The fully-decoded query string is scanned as a whole for dangerous parameter names. If ANY dangerous param is found anywhere in the decoded form, the **entire query is rejected** — no selective stripping.
+- **Hard 400 rejection**: Returns `400 { error: "Request contains prohibited query parameters" }` and does NOT call `next()`.
+- **Value scanning**: `sanitizeParamsObject()` also checks parameter values (not just keys) for smuggled params via encoded `&`.
+
+Tests: `tests/test-security/security-solr-ssrf.spec.js`
+
+### JBrowse input sanitization (`routes/JBrowse.js`)
+
+All JBrowse endpoints sanitize user inputs before interpolating into Solr queries:
+- `sanitizeSolrValue()` strips `& = ? # ; \ { } [ ] " ' \`` from string inputs
+- `sanitizeNumeric()` validates against `/^-?\d+(\.\d+)?$/`, returns null on failure → early 400 response
+
+### Other security fixes
+
+- XSS fixes documented in `SECURITY_FIX.md`: parameter name validation in `http-params.js`, error message sanitization in `RQLQueryParser.js`, security headers (CSP, X-Frame-Options, etc.) in `app.js`
+- IDOR fix in `APIMethodHandler.js`: multi-ID get requests check permissions on every document, not just the first
+- Numeric input validation: invalid numeric params return clean 400 instead of forwarding to Solr (which leaked internal error details)
 
 ## Debug Logging
 
@@ -211,6 +234,7 @@ DEBUG=p3api-server:app,p3api-server:media,RQLQueryParser npm start
 | `RQLQueryParser` | middleware/RQLQueryParser.js | RQL to Solr query conversion |
 | `SOLRQueryParser` | middleware/SolrQueryParser.js | Direct Solr query parsing |
 | `ShardsPreference` | middleware/ShardsPreference.js | Shard preference selection |
+| `p3api-server:SolrQuerySanitizer` | middleware/SolrQuerySanitizer.js | Dangerous Solr param blocking, encoding bypass detection |
 
 #### Routes
 | Namespace | File | Description |

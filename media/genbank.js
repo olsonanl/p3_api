@@ -23,9 +23,54 @@
  */
 
 const debug = require('debug')('p3api-server:media:genbank')
-const axios = require('axios')
+const Solrjs = require('../lib/solrjs')
 const Config = require('../config')
 const { Transform } = require('stream')
+const Web = require('../web')
+
+const SOLR_URL = Config.get('solr').url
+
+/**
+ * Query a Solr collection with structured params.
+ * Uses the standard Solrjs client (works through the Solr proxy URL,
+ * no direct replica access required).
+ */
+async function solrQuery (collection, params) {
+  const solrClient = new Solrjs(SOLR_URL + '/' + collection)
+  solrClient.setAgent(Web.getSolrAgent())
+
+  const parts = []
+  parts.push('q=' + encodeURIComponent(params.q || '*:*'))
+  parts.push('rows=' + (params.rows || 10))
+  if (params.start) parts.push('start=' + params.start)
+  if (params.sort) parts.push('sort=' + encodeURIComponent(params.sort))
+  if (params.fl) parts.push('fl=' + encodeURIComponent(params.fl))
+
+  if (params.fq) {
+    const fqs = Array.isArray(params.fq) ? params.fq : [params.fq]
+    for (const f of fqs) {
+      parts.push('fq=' + encodeURIComponent(f))
+    }
+  }
+
+  const query = parts.join('&')
+  debug(`solrQuery ${collection}: ${query}`)
+  return solrClient.query(query)
+}
+
+async function solrFetchGenomeMetadata (genomeIds, fields) {
+  const termsFilter = '{!terms f=genome_id}' + genomeIds.join(',')
+  const result = await solrQuery('genome', {
+    fq: termsFilter,
+    fl: fields.join(','),
+    rows: genomeIds.length
+  })
+  const dict = {}
+  for (const doc of (result.response?.docs || [])) {
+    if (doc.genome_id) dict[doc.genome_id] = doc
+  }
+  return dict
+}
 
 const SEQUENCE_LINE_LENGTH = 60 // Characters per sequence line
 const SEQUENCE_BLOCK_SIZE = 10 // Characters per block in sequence
@@ -362,131 +407,22 @@ function writeRecordHeader (res, genome, contig) {
   }
 }
 
-/**
- * Stream features for a single contig and write them to response
- */
-async function streamFeaturesForContig (res, genomeId, accession, req) {
-  const distributeURL = Config.get('distributeURL')
-  let url = distributeURL
-  if (url.charAt(url.length - 1) !== '/') {
-    url += '/'
-  }
-  url += 'genome_feature/'
+const CONTIG_FEATURE_FIELDS = 'feature_type,start,end,strand,patric_id,refseq_locus_tag,gene,product,protein_id,figfam_id,pgfam_id,plfam_id'
 
-  const fields = 'feature_type,start,end,strand,patric_id,refseq_locus_tag,gene,product,protein_id,figfam_id,pgfam_id,plfam_id'
-  const q = `eq(genome_id,${genomeId})&eq(accession,${encodeURIComponent(accession)})&ne(feature_type,source)&sort(+start)&limit(100000)&select(${fields})`
-
-  debug(`Streaming features for contig ${accession}`)
-
-  return new Promise((resolve, reject) => {
-    axios({
-      method: 'post',
-      url: url,
-      data: q,
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/rqlquery+x-www-form-urlencoded',
-        authorization: (req && req.headers.authorization) ? req.headers.authorization : ''
-      },
-      responseType: 'stream'
-    }).then(response => {
-      let buffer = ''
-      let featureCount = 0
-      let inArray = false
-
-      response.data.on('data', (chunk) => {
-        buffer += chunk.toString()
-
-        // Parse JSON array incrementally
-        // We expect: [{...},{...},...]
-        let startIdx = 0
-
-        while (startIdx < buffer.length) {
-          // Skip whitespace and array brackets
-          while (startIdx < buffer.length && /[\s\[,]/.test(buffer[startIdx])) {
-            if (buffer[startIdx] === '[') inArray = true
-            startIdx++
-          }
-
-          if (startIdx >= buffer.length) break
-
-          // Check for end of array
-          if (buffer[startIdx] === ']') {
-            buffer = buffer.substring(startIdx + 1)
-            break
-          }
-
-          // Try to find complete JSON object
-          if (buffer[startIdx] === '{') {
-            let depth = 0
-            let endIdx = startIdx
-            let inString = false
-            let escaped = false
-
-            while (endIdx < buffer.length) {
-              const char = buffer[endIdx]
-
-              if (escaped) {
-                escaped = false
-              } else if (char === '\\' && inString) {
-                escaped = true
-              } else if (char === '"' && !escaped) {
-                inString = !inString
-              } else if (!inString) {
-                if (char === '{') depth++
-                else if (char === '}') {
-                  depth--
-                  if (depth === 0) {
-                    // Found complete object
-                    const jsonStr = buffer.substring(startIdx, endIdx + 1)
-                    try {
-                      const feature = JSON.parse(jsonStr)
-                      if (feature.feature_type !== 'source') {
-                        const gbType = mapFeatureType(feature.feature_type)
-                        res.write(formatFeature(feature, gbType) + '\n')
-                        featureCount++
-                      }
-                    } catch (e) {
-                      debug(`Failed to parse feature JSON: ${e.message}`)
-                    }
-                    startIdx = endIdx + 1
-                    break
-                  }
-                }
-              }
-              endIdx++
-            }
-
-            // If we didn't find complete object, keep buffer for next chunk
-            if (depth !== 0) {
-              buffer = buffer.substring(startIdx)
-              break
-            }
-          } else {
-            // Not a valid start, skip
-            startIdx++
-          }
-        }
-
-        // Keep remaining incomplete data
-        if (startIdx < buffer.length && !buffer.substring(startIdx).match(/^[\s\]]*$/)) {
-          buffer = buffer.substring(startIdx)
-        } else {
-          buffer = ''
-        }
-      })
-
-      response.data.on('end', () => {
-        debug(`Streamed ${featureCount} features for contig ${accession}`)
-        resolve(featureCount)
-      })
-
-      response.data.on('error', (err) => {
-        debug(`Error streaming features: ${err.message}`)
-        reject(err)
-      })
-    }).catch(reject)
+async function streamFeaturesForContig (res, genomeId, accession) {
+  const result = await solrQuery('genome_feature', {
+    fq: ['genome_id:' + genomeId, 'accession:' + accession, '-feature_type:source'],
+    rows: 100000,
+    sort: 'start asc',
+    fl: CONTIG_FEATURE_FIELDS
   })
+  const docs = result.response?.docs || []
+  for (const feature of docs) {
+    const gbType = mapFeatureType(feature.feature_type)
+    res.write(formatFeature(feature, gbType) + '\n')
+  }
+  debug(`Wrote ${docs.length} features for contig ${accession}`)
+  return docs.length
 }
 
 /**
@@ -500,276 +436,70 @@ function writeOrigin (res, sequence) {
   }
 }
 
-/**
- * Stream contigs and generate Genbank records
- */
-async function streamGenbankMultiRecord (res, genomeId, genome, req) {
-  const distributeURL = Config.get('distributeURL')
-  let url = distributeURL
-  if (url.charAt(url.length - 1) !== '/') {
-    url += '/'
-  }
-  url += 'genome_sequence/'
+async function streamGenbankMultiRecord (res, genomeId, genome) {
+  const contigs = await fetchContigs(genomeId)
+  let contigCount = 0
 
-  const q = `eq(genome_id,${genomeId})&sort(+accession)&limit(10000)`
+  for (const contig of contigs) {
+    const accession = contig.accession || contig.sequence_id
 
-  debug(`Streaming contigs for genome ${genomeId}`)
-
-  return new Promise((resolve, reject) => {
-    axios({
-      method: 'post',
-      url: url,
-      data: q,
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/rqlquery+x-www-form-urlencoded',
-        authorization: (req && req.headers.authorization) ? req.headers.authorization : ''
-      },
-      responseType: 'stream'
-    }).then(response => {
-      let buffer = ''
-      let contigCount = 0
-      let isFirstContig = true
-      const contigQueue = []
-      let processing = false
-      let streamEnded = false
-      let currentProcessingPromise = null
-
-      const processContigQueue = async () => {
-        if (processing) return currentProcessingPromise
-        if (contigQueue.length === 0) return Promise.resolve()
-
-        processing = true
-        currentProcessingPromise = (async () => {
-          while (contigQueue.length > 0) {
-            const contig = contigQueue.shift()
-            const accession = contig.accession || contig.sequence_id
-
-            debug(`Processing contig ${accession}`)
-
-            // Add newline between records
-            if (!isFirstContig) {
-              res.write('\n')
-            }
-            isFirstContig = false
-
-            // Write header
-            writeRecordHeader(res, genome, contig)
-
-            // Stream features
-            try {
-              await streamFeaturesForContig(res, genomeId, accession, req)
-            } catch (err) {
-              debug(`Error streaming features for ${accession}: ${err.message}`)
-            }
-
-            // Write sequence
-            writeOrigin(res, contig.sequence)
-            contigCount++
-          }
-          processing = false
-        })()
-
-        return currentProcessingPromise
-      }
-
-      const checkComplete = async () => {
-        if (streamEnded && contigQueue.length === 0 && !processing) {
-          debug(`Streamed ${contigCount} contigs for genome ${genomeId}`)
-          resolve(contigCount)
-        } else if (streamEnded && (contigQueue.length > 0 || processing)) {
-          // Wait for processing to complete
-          if (currentProcessingPromise) {
-            await currentProcessingPromise
-          }
-          // Process any remaining items
-          if (contigQueue.length > 0) {
-            await processContigQueue()
-          }
-          debug(`Streamed ${contigCount} contigs for genome ${genomeId}`)
-          resolve(contigCount)
-        }
-      }
-
-      response.data.on('data', (chunk) => {
-        buffer += chunk.toString()
-
-        // Parse JSON array incrementally
-        let startIdx = 0
-
-        while (startIdx < buffer.length) {
-          while (startIdx < buffer.length && /[\s\[,]/.test(buffer[startIdx])) {
-            startIdx++
-          }
-
-          if (startIdx >= buffer.length) break
-          if (buffer[startIdx] === ']') {
-            buffer = buffer.substring(startIdx + 1)
-            break
-          }
-
-          if (buffer[startIdx] === '{') {
-            let depth = 0
-            let endIdx = startIdx
-            let inString = false
-            let escaped = false
-
-            while (endIdx < buffer.length) {
-              const char = buffer[endIdx]
-
-              if (escaped) {
-                escaped = false
-              } else if (char === '\\' && inString) {
-                escaped = true
-              } else if (char === '"' && !escaped) {
-                inString = !inString
-              } else if (!inString) {
-                if (char === '{') depth++
-                else if (char === '}') {
-                  depth--
-                  if (depth === 0) {
-                    const jsonStr = buffer.substring(startIdx, endIdx + 1)
-                    try {
-                      const contig = JSON.parse(jsonStr)
-                      contigQueue.push(contig)
-                    } catch (e) {
-                      debug(`Failed to parse contig JSON: ${e.message}`)
-                    }
-                    startIdx = endIdx + 1
-                    break
-                  }
-                }
-              }
-              endIdx++
-            }
-
-            if (depth !== 0) {
-              buffer = buffer.substring(startIdx)
-              break
-            }
-          } else {
-            startIdx++
-          }
-        }
-
-        if (startIdx < buffer.length && !buffer.substring(startIdx).match(/^[\s\]]*$/)) {
-          buffer = buffer.substring(startIdx)
-        } else {
-          buffer = ''
-        }
-
-        // Start processing if not already running
-        processContigQueue()
-      })
-
-      response.data.on('end', async () => {
-        streamEnded = true
-        await checkComplete()
-      })
-
-      response.data.on('error', (err) => {
-        debug(`Error streaming contigs: ${err.message}`)
-        reject(err)
-      })
-    }).catch(reject)
-  })
-}
-
-/**
- * Fetch genome metadata
- */
-async function fetchGenome (genomeId, req) {
-  const distributeURL = Config.get('distributeURL')
-  let url = distributeURL
-  if (url.charAt(url.length - 1) !== '/') {
-    url += '/'
-  }
-  url += 'genome/'
-
-  const q = `eq(genome_id,${genomeId})&limit(1)`
-  const fields = 'genome_id,genome_name,organism_name,taxon_id,taxon_lineage_names,strain,bioproject_accession,biosample_accession,completion_date,comments'
-
-  try {
-    const response = await axios.post(url, `${q}&select(${fields})`, {
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/rqlquery+x-www-form-urlencoded',
-        authorization: (req && req.headers.authorization) ? req.headers.authorization : ''
-      }
-    })
-    return response.data[0] || {}
-  } catch (err) {
-    debug(`Failed to fetch genome: ${err.message}`)
-    return {}
-  }
-}
-
-/**
- * Fetch contigs for merged mode (non-streaming - needs all data)
- */
-async function fetchContigs (genomeId, req) {
-  const distributeURL = Config.get('distributeURL')
-  let url = distributeURL
-  if (url.charAt(url.length - 1) !== '/') {
-    url += '/'
-  }
-  url += 'genome_sequence/'
-
-  const q = `eq(genome_id,${genomeId})&limit(10000)&sort(+accession)`
-
-  try {
-    const response = await axios.post(url, q, {
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/rqlquery+x-www-form-urlencoded',
-        authorization: (req && req.headers.authorization) ? req.headers.authorization : ''
-      }
-    })
-    return response.data || []
-  } catch (err) {
-    debug(`Failed to fetch contigs: ${err.message}`)
-    return []
-  }
-}
-
-/**
- * Fetch features for merged mode (non-streaming - needs all data)
- */
-async function fetchFeatures (genomeId, req) {
-  const distributeURL = Config.get('distributeURL')
-  let url = distributeURL
-  if (url.charAt(url.length - 1) !== '/') {
-    url += '/'
-  }
-  url += 'genome_feature/'
-
-  const fields = 'accession,feature_type,start,end,strand,patric_id,refseq_locus_tag,gene,product,protein_id,figfam_id,pgfam_id,plfam_id,aa_sequence_md5'
-  const q = `eq(genome_id,${genomeId})&ne(feature_type,source)&limit(100000)&select(${fields})`
-
-  try {
-    const response = await axios.post(url, q, {
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/rqlquery+x-www-form-urlencoded',
-        authorization: (req && req.headers.authorization) ? req.headers.authorization : ''
-      }
-    })
-
-    // Group features by accession
-    const featuresByAccession = {}
-    for (const feature of response.data || []) {
-      const acc = feature.accession || 'unknown'
-      if (!featuresByAccession[acc]) {
-        featuresByAccession[acc] = []
-      }
-      featuresByAccession[acc].push(feature)
+    if (contigCount > 0) {
+      res.write('\n')
     }
 
-    return featuresByAccession
-  } catch (err) {
-    debug(`Failed to fetch features: ${err.message}`)
-    return {}
+    writeRecordHeader(res, genome, contig)
+
+    try {
+      await streamFeaturesForContig(res, genomeId, accession)
+    } catch (err) {
+      debug(`Error fetching features for ${accession}: ${err.message}`)
+    }
+
+    writeOrigin(res, contig.sequence)
+    contigCount++
   }
+
+  debug(`Processed ${contigCount} contigs for genome ${genomeId}`)
+  return contigCount
+}
+
+const GENOME_FIELDS = ['genome_id', 'genome_name', 'organism_name', 'taxon_id', 'taxon_lineage_names', 'strain', 'bioproject_accession', 'biosample_accession', 'completion_date', 'comments']
+
+async function fetchGenome (genomeId) {
+  const dict = await solrFetchGenomeMetadata([genomeId], GENOME_FIELDS)
+  return dict[genomeId] || {}
+}
+
+async function fetchContigs (genomeId) {
+  const result = await solrQuery('genome_sequence', {
+    fq: 'genome_id:' + genomeId,
+    rows: 10000,
+    sort: 'accession asc'
+  })
+  return result.response?.docs || []
+}
+
+const FEATURE_FIELDS = 'accession,feature_type,start,end,strand,patric_id,refseq_locus_tag,gene,product,protein_id,figfam_id,pgfam_id,plfam_id,aa_sequence_md5'
+
+function groupFeaturesByAccession (docs) {
+  const featuresByAccession = {}
+  for (const feature of docs) {
+    const acc = feature.accession || 'unknown'
+    if (!featuresByAccession[acc]) {
+      featuresByAccession[acc] = []
+    }
+    featuresByAccession[acc].push(feature)
+  }
+  return featuresByAccession
+}
+
+async function fetchFeatures (genomeId) {
+  const result = await solrQuery('genome_feature', {
+    fq: ['genome_id:' + genomeId, '-feature_type:source'],
+    rows: 100000,
+    fl: FEATURE_FIELDS
+  })
+  return groupFeaturesByAccession(result.response?.docs || [])
 }
 
 /**
@@ -1019,15 +749,15 @@ module.exports = {
         isFirstGenome = false
 
         // Fetch genome metadata
-        const genome = await fetchGenome(genomeId, req)
+        const genome = await fetchGenome(genomeId)
 
         if (isMerged) {
           // Merged mode: non-streaming, needs all data in memory per genome
           debug(`Generating merged Genbank record for genome ${genomeId}`)
 
           const [contigs, featuresByAccession] = await Promise.all([
-            fetchContigs(genomeId, req),
-            fetchFeatures(genomeId, req)
+            fetchContigs(genomeId),
+            fetchFeatures(genomeId)
           ])
 
           if (contigs.length === 0) {
@@ -1042,7 +772,7 @@ module.exports = {
           // Multi-record mode: streaming
           debug(`Streaming Genbank records for genome ${genomeId}`)
 
-          const contigCount = await streamGenbankMultiRecord(res, genomeId, genome, req)
+          const contigCount = await streamGenbankMultiRecord(res, genomeId, genome)
           totalContigs += contigCount
 
           if (contigCount === 0) {
