@@ -87,7 +87,7 @@ curl -sS -N ${RATE_ARG[@]+"${RATE_ARG[@]}"} \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   -H 'Accept-Encoding: identity' \
   --data-raw "rql=${ENC_RQL}" \
-  -w 'CURLSUMMARY http_code=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s size=%{size_download} speed=%{speed_download}B/s connects=%{num_connects}\n' \
+  -w 'CURLSUMMARY http_code=%{http_code} http_ver=%{http_version} ttfb=%{time_starttransfer}s total=%{time_total}s size=%{size_download} speed=%{speed_download}B/s connects=%{num_connects} errormsg=%{errormsg}\n' \
   "$URL" \
   2> >(grep CURLSUMMARY >&2) \
   | run_meter > "$OUT"
@@ -97,4 +97,13 @@ echo
 echo "curl exit: $CURL_EXIT  (0=ok, 18=partial/transfer closed, 28=timeout, 56=recv error)"
 echo "LOCUS records written: $(grep -c '^LOCUS' "$OUT" 2>/dev/null || echo 0)"
 echo "last genome in file:   $(grep '^LOCUS' "$OUT" 2>/dev/null | tail -1 | awk '{print $2}')"
+# A complete GenBank stream ends each record with a // terminator line; the very
+# last line of a fully-delivered file is '//'. If it is not, the stream was
+# truncated mid-record (partial transfer).
+LAST_LINE="$(tail -1 "$OUT" 2>/dev/null)"
+if [ "$LAST_LINE" = "//" ]; then
+  echo "completeness: OK (file ends with //)"
+else
+  echo "completeness: TRUNCATED (last line: '${LAST_LINE:0:60}')"
+fi
 echo "output kept at: $OUT"
