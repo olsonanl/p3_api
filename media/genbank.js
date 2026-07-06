@@ -431,13 +431,12 @@ function writeOrigin (res, sequence) {
   }
 }
 
-async function streamGenbankMultiRecord (res, genomeId, genome) {
-  // Fetch contigs and ALL features for the genome in two queries (not one
-  // query per contig — that was O(contigs) round-trips and dominated runtime).
-  const [contigs, featuresByAccession] = await Promise.all([
-    fetchContigs(genomeId),
-    fetchFeatures(genomeId)
-  ])
+/**
+ * Write all GenBank records for one genome from pre-fetched data (multi-record
+ * mode). Pure synchronous formatting — no Solr I/O — so callers can overlap the
+ * fetch of the next genome with writing this one.
+ */
+function writeGenbankMultiRecord (res, genome, contigs, featuresByAccession) {
   let contigCount = 0
 
   for (const contig of contigs) {
@@ -457,8 +456,21 @@ async function streamGenbankMultiRecord (res, genomeId, genome) {
     contigCount++
   }
 
-  debug(`Processed ${contigCount} contigs for genome ${genomeId}`)
   return contigCount
+}
+
+/**
+ * Fetch all Solr data for one genome — metadata, contigs, and features — in a
+ * single parallel wave. Collapses what were two serial round-trip waves
+ * (genome, then contigs+features) into one.
+ */
+async function fetchGenomeData (genomeId) {
+  const [genome, contigs, featuresByAccession] = await Promise.all([
+    fetchGenome(genomeId),
+    fetchContigs(genomeId),
+    fetchFeatures(genomeId)
+  ])
+  return { genome, contigs, featuresByAccession }
 }
 
 const GENOME_FIELDS = ['genome_id', 'genome_name', 'organism_name', 'taxon_id', 'taxon_lineage_names', 'strain', 'bioproject_accession', 'biosample_accession', 'completion_date', 'comments']
@@ -739,43 +751,47 @@ module.exports = {
       let isFirstGenome = true
       let totalContigs = 0
 
-      for (const genomeId of genomeIds) {
-        // Add newline separator between genomes (but records within a genome are already separated)
+      // Pipeline: prefetch the next genome's Solr data (one parallel wave per
+      // genome) while formatting/writing the current one. Formatting is pure
+      // CPU, so this overlaps network latency across genomes.
+      let nextFetch = fetchGenomeData(genomeIds[0])
+
+      for (let i = 0; i < genomeIds.length; i++) {
+        const genomeId = genomeIds[i]
+        const { genome, contigs, featuresByAccession } = await nextFetch
+
+        // Kick off the next genome's fetch before writing this one.
+        nextFetch = i + 1 < genomeIds.length
+          ? fetchGenomeData(genomeIds[i + 1])
+          : null
+        // Mark the in-flight prefetch as handled so a write error in this
+        // iteration doesn't orphan it into an unhandled rejection. The real
+        // await at the top of the next iteration still surfaces any error.
+        if (nextFetch) nextFetch.catch(() => {})
+
+        if (contigs.length === 0) {
+          debug(`No sequence data found for genome ${genomeId}, skipping`)
+          continue
+        }
+
+        // Add newline separator between genomes (records within a genome are
+        // already separated). Only emitted once we know this genome has output.
         if (!isFirstGenome) {
           res.write('\n')
         }
         isFirstGenome = false
 
-        // Fetch genome metadata
-        const genome = await fetchGenome(genomeId)
-
         if (isMerged) {
-          // Merged mode: non-streaming, needs all data in memory per genome
+          // Merged mode: concatenate all contigs into a single record
           debug(`Generating merged Genbank record for genome ${genomeId}`)
-
-          const [contigs, featuresByAccession] = await Promise.all([
-            fetchContigs(genomeId),
-            fetchFeatures(genomeId)
-          ])
-
-          if (contigs.length === 0) {
-            debug(`No sequence data found for genome ${genomeId}, skipping`)
-            continue
-          }
-
           const record = generateMergedGenbankRecord(genome, contigs, featuresByAccession)
           res.write(record)
           totalContigs++
         } else {
-          // Multi-record mode: streaming
-          debug(`Streaming Genbank records for genome ${genomeId}`)
-
-          const contigCount = await streamGenbankMultiRecord(res, genomeId, genome)
+          // Multi-record mode: one record per contig
+          debug(`Writing Genbank records for genome ${genomeId}`)
+          const contigCount = writeGenbankMultiRecord(res, genome, contigs, featuresByAccession)
           totalContigs += contigCount
-
-          if (contigCount === 0) {
-            debug(`No contigs found for genome ${genomeId}`)
-          }
         }
       }
 
