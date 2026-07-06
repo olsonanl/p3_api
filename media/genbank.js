@@ -407,22 +407,17 @@ function writeRecordHeader (res, genome, contig) {
   }
 }
 
-const CONTIG_FEATURE_FIELDS = 'feature_type,start,end,strand,patric_id,refseq_locus_tag,gene,product,protein_id,figfam_id,pgfam_id,plfam_id'
-
-async function streamFeaturesForContig (res, genomeId, accession) {
-  const result = await solrQuery('genome_feature', {
-    fq: ['genome_id:' + genomeId, 'accession:' + accession, '-feature_type:source'],
-    rows: 100000,
-    sort: 'start asc',
-    fl: CONTIG_FEATURE_FIELDS
-  })
-  const docs = result.response?.docs || []
-  for (const feature of docs) {
+/**
+ * Write pre-fetched features (already scoped to one contig) to the response,
+ * ordered by start coordinate.
+ */
+function writeFeaturesForContig (res, features) {
+  const sorted = features.slice().sort((a, b) => (a.start || 0) - (b.start || 0))
+  for (const feature of sorted) {
     const gbType = mapFeatureType(feature.feature_type)
     res.write(formatFeature(feature, gbType) + '\n')
   }
-  debug(`Wrote ${docs.length} features for contig ${accession}`)
-  return docs.length
+  return sorted.length
 }
 
 /**
@@ -437,7 +432,12 @@ function writeOrigin (res, sequence) {
 }
 
 async function streamGenbankMultiRecord (res, genomeId, genome) {
-  const contigs = await fetchContigs(genomeId)
+  // Fetch contigs and ALL features for the genome in two queries (not one
+  // query per contig — that was O(contigs) round-trips and dominated runtime).
+  const [contigs, featuresByAccession] = await Promise.all([
+    fetchContigs(genomeId),
+    fetchFeatures(genomeId)
+  ])
   let contigCount = 0
 
   for (const contig of contigs) {
@@ -449,11 +449,9 @@ async function streamGenbankMultiRecord (res, genomeId, genome) {
 
     writeRecordHeader(res, genome, contig)
 
-    try {
-      await streamFeaturesForContig(res, genomeId, accession)
-    } catch (err) {
-      debug(`Error fetching features for ${accession}: ${err.message}`)
-    }
+    const features = featuresByAccession[accession] || []
+    writeFeaturesForContig(res, features)
+    debug(`Wrote ${features.length} features for contig ${accession}`)
 
     writeOrigin(res, contig.sequence)
     contigCount++
