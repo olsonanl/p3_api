@@ -87,7 +87,7 @@ curl -sS -N ${RATE_ARG[@]+"${RATE_ARG[@]}"} \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   -H 'Accept-Encoding: identity' \
   --data-raw "rql=${ENC_RQL}" \
-  -w 'CURLSUMMARY http_code=%{http_code} http_ver=%{http_version} ttfb=%{time_starttransfer}s total=%{time_total}s size=%{size_download} speed=%{speed_download}B/s connects=%{num_connects} errormsg=%{errormsg}\n' \
+  -w '%{stderr}CURLSUMMARY http_code=%{http_code} http_ver=%{http_version} ttfb=%{time_starttransfer}s total=%{time_total}s size=%{size_download} speed=%{speed_download}B/s connects=%{num_connects} errormsg=%{errormsg}\n' \
   "$URL" \
   2> >(grep CURLSUMMARY >&2) \
   | run_meter > "$OUT"
