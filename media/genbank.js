@@ -13,9 +13,15 @@
  *   - Requires all contigs and features in memory for coordinate adjustment
  *   - Use only for genomes that fit comfortably in memory
  *
- * Usage:
- *   GET /genome_sequence/?eq(genome_id,GENOME_ID)&http_accept=application/genbank
- *   GET /genome_feature/?eq(genome_id,GENOME_ID)&http_accept=application/genbank
+ * Usage (request against the genome collection):
+ *   GET /genome/?eq(genome_id,GENOME_ID)&http_accept=application/genbank
+ *   GET /genome/?in(genome_id,(ID1,ID2,...))&http_download=true&http_accept=application/genbank
+ *
+ * The serializer only needs the genome_id list from the query and fetches
+ * genome metadata, contigs, and features itself. Requesting GenBank from a
+ * feature-level collection (genome_feature) is rejected by a guard in
+ * routes/dataType.js because it would stream millions of feature docs just to
+ * recover the genome_id list.
  *
  * Options (via query parameters):
  *   http_genbank_merged=true - Merge all contigs into a single record

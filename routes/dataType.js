@@ -216,6 +216,26 @@ router.post('*', [
 ])
 
 router.use([
+  // GenBank downloads must be issued against the `genome` collection. Issuing
+  // them against a feature-level collection (e.g. genome_feature) forces the
+  // pipeline to stream millions of feature docs just to recover the genome_id
+  // list the serializer needs, adding a large pre-output stall. Reject early
+  // with a clear message rather than silently doing the expensive thing.
+  function genbankCollectionGuard (req, res, next) {
+    if (
+      req.isDownload &&
+      req.headers && req.headers.accept === 'application/genbank' &&
+      req.call_collection && req.call_collection !== 'genome'
+    ) {
+      return res.status(400).send({
+        status: 400,
+        message: 'GenBank downloads must be requested from the genome collection. ' +
+          'Use /genome/ with a genome_id filter (e.g. /genome/?in(genome_id,(...))) ' +
+          'instead of /' + req.call_collection + '/.'
+      })
+    }
+    next()
+  },
   RQLQueryParser,
   // SOLRQueryParser, // this parses the solr query for errors, but doesn't make any chagnes to the stream.  Debugging only.
   SolrQuerySanitizer,
