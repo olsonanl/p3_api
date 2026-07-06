@@ -39,6 +39,38 @@ const Web = require('../web')
 
 const SOLR_URL = Config.get('solr').url
 
+// --- Solr fetch tuning (diagnostic / mitigation knobs) ---------------------
+// GENBANK_SOLR_KEEPALIVE=0 gives the genbank fetches their own agent with
+// keepAlive DISABLED. Use this to A/B test the stale-keepalive-socket theory:
+// if the multi-minute fetch stalls vanish with keepalive off, a pooled socket
+// the server had already dropped was the cause.
+// GENBANK_SOLR_TIMEOUT_MS (default 30000) aborts a Solr request that accepts
+// but never responds, turning a ~166s hang into a prompt error. Set 0 to
+// disable the timeout entirely.
+const GENBANK_SOLR_KEEPALIVE = process.env.GENBANK_SOLR_KEEPALIVE !== '0'
+const GENBANK_SOLR_TIMEOUT_MS = process.env.GENBANK_SOLR_TIMEOUT_MS !== undefined
+  ? parseInt(process.env.GENBANK_SOLR_TIMEOUT_MS, 10)
+  : 30000
+
+// Dedicated non-keepalive agent, built lazily only when keepalive is disabled.
+let noKeepAliveAgent = null
+function getGenbankSolrAgent () {
+  if (GENBANK_SOLR_KEEPALIVE) {
+    // Default: share the standard pooled agent (same as APIMethodHandler).
+    return Web.getSolrAgent()
+  }
+  if (!noKeepAliveAgent) {
+    const isHttps = SOLR_URL.startsWith('https:')
+    const mod = isHttps ? require('https') : require('http')
+    // Mirror the TLS posture of the shared agent (self-signed Solr certs).
+    const opts = { keepAlive: false, maxSockets: 8 }
+    if (isHttps) opts.rejectUnauthorized = false
+    noKeepAliveAgent = new mod.Agent(opts)
+    timing('genbank Solr fetches using NON-keepAlive agent')
+  }
+  return noKeepAliveAgent
+}
+
 // Milliseconds elapsed since an hrtime.bigint() mark. Uses a monotonic clock so
 // it is unaffected by wall-clock adjustments (and safe under --frozen intrinsics
 // that block Date.now in some contexts).
@@ -51,10 +83,15 @@ function msSince (startNs) {
  * Uses the standard Solrjs client (works through the Solr proxy URL,
  * no direct replica access required).
  */
-async function solrQuery (collection, params) {
-  const solrClient = new Solrjs(SOLR_URL + '/' + collection)
-  solrClient.setAgent(Web.getSolrAgent())
+// One retry after a timeout. A stale keepAlive socket fails fast on the second
+// try because the pool discards the destroyed socket and dials a fresh one — so
+// a retry both survives the transient hang and confirms the socket theory (the
+// retry succeeds quickly). Set GENBANK_SOLR_RETRIES=0 to disable.
+const GENBANK_SOLR_RETRIES = process.env.GENBANK_SOLR_RETRIES !== undefined
+  ? parseInt(process.env.GENBANK_SOLR_RETRIES, 10)
+  : 1
 
+async function solrQuery (collection, params) {
   const parts = []
   parts.push('q=' + encodeURIComponent(params.q || '*:*'))
   parts.push('rows=' + (params.rows || 10))
@@ -71,7 +108,28 @@ async function solrQuery (collection, params) {
 
   const query = parts.join('&')
   debug(`solrQuery ${collection}: ${query}`)
-  return solrClient.query(query)
+
+  let lastErr
+  for (let attempt = 0; attempt <= GENBANK_SOLR_RETRIES; attempt++) {
+    const solrClient = new Solrjs(SOLR_URL + '/' + collection)
+    solrClient.setAgent(getGenbankSolrAgent())
+    if (GENBANK_SOLR_TIMEOUT_MS) {
+      solrClient.timeout = GENBANK_SOLR_TIMEOUT_MS
+    }
+    try {
+      const t0 = process.hrtime.bigint()
+      const result = await solrClient.query(query)
+      if (attempt > 0) {
+        timing(`solrQuery ${collection} SUCCEEDED on retry ${attempt} in ${msSince(t0).toFixed(0)}ms`)
+      }
+      return result
+    } catch (err) {
+      lastErr = err
+      timing(`solrQuery ${collection} attempt ${attempt} failed: ${err.message}`)
+      if (attempt >= GENBANK_SOLR_RETRIES) break
+    }
+  }
+  throw lastErr
 }
 
 async function solrFetchGenomeMetadata (genomeIds, fields) {
