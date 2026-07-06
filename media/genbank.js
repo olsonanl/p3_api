@@ -29,12 +29,22 @@
  */
 
 const debug = require('debug')('p3api-server:media:genbank')
+// Dedicated timing namespace so it can be toggled independently of the verbose
+// per-contig debug output: DEBUG=p3api-server:media:genbank:timing
+const timing = require('debug')('p3api-server:media:genbank:timing')
 const Solrjs = require('../lib/solrjs')
 const Config = require('../config')
 const { Transform } = require('stream')
 const Web = require('../web')
 
 const SOLR_URL = Config.get('solr').url
+
+// Milliseconds elapsed since an hrtime.bigint() mark. Uses a monotonic clock so
+// it is unaffected by wall-clock adjustments (and safe under --frozen intrinsics
+// that block Date.now in some contexts).
+function msSince (startNs) {
+  return Number(process.hrtime.bigint() - startNs) / 1e6
+}
 
 /**
  * Query a Solr collection with structured params.
@@ -478,10 +488,14 @@ function buildOrigin (sequence) {
  */
 async function writeGenbankMultiRecord (res, genome, contigs, featuresByAccession) {
   let contigCount = 0
+  let formatMs = 0 // synchronous record-building time (blocks the event loop)
+  let writeMs = 0 // time awaiting res.write backpressure (client drain)
+  let bytes = 0
 
   for (const contig of contigs) {
     const accession = contig.accession || contig.sequence_id
 
+    const fmtStart = process.hrtime.bigint()
     let record = contigCount > 0 ? '\n' : ''
     record += buildRecordHeader(genome, contig)
 
@@ -491,8 +505,12 @@ async function writeGenbankMultiRecord (res, genome, contigs, featuresByAccessio
     debug(`Wrote ${built.count} features for contig ${accession}`)
 
     record += buildOrigin(contig.sequence)
+    formatMs += msSince(fmtStart)
+    bytes += record.length
 
+    const wrStart = process.hrtime.bigint()
     const ok = await writeChunk(res, record)
+    writeMs += msSince(wrStart)
     contigCount++
     if (!ok) {
       // Client disconnected — stop writing this genome.
@@ -500,7 +518,7 @@ async function writeGenbankMultiRecord (res, genome, contigs, featuresByAccessio
     }
   }
 
-  return contigCount
+  return { contigCount, formatMs, writeMs, bytes }
 }
 
 /**
@@ -801,6 +819,16 @@ module.exports = {
       let isFirstGenome = true
       let totalContigs = 0
 
+      // Timing accumulators (ms). fetchWait = time blocked waiting on Solr that
+      // the prefetch pipeline did NOT hide; format = synchronous record-building
+      // (blocks the event loop); write = time awaiting client drain
+      // (backpressure). Summarized per request under the :timing namespace.
+      const reqStart = process.hrtime.bigint()
+      let fetchWaitMs = 0
+      let formatMs = 0
+      let writeMs = 0
+      let totalBytes = 0
+
       // Pipeline: prefetch the next genome's Solr data (one parallel wave per
       // genome) while formatting/writing the current one. Formatting is pure
       // CPU, so this overlaps network latency across genomes.
@@ -808,7 +836,10 @@ module.exports = {
 
       for (let i = 0; i < genomeIds.length; i++) {
         const genomeId = genomeIds[i]
+        const waitStart = process.hrtime.bigint()
         const { genome, contigs, featuresByAccession } = await nextFetch
+        const thisFetchWait = msSince(waitStart)
+        fetchWaitMs += thisFetchWait
 
         // Kick off the next genome's fetch before writing this one.
         nextFetch = i + 1 < genomeIds.length
@@ -834,23 +865,42 @@ module.exports = {
         // Add newline separator between genomes (records within a genome are
         // already separated). Only emitted once we know this genome has output.
         if (!isFirstGenome) {
+          const sepStart = process.hrtime.bigint()
           await writeChunk(res, '\n')
+          writeMs += msSince(sepStart)
         }
         isFirstGenome = false
 
         if (isMerged) {
           // Merged mode: concatenate all contigs into a single record
           debug(`Generating merged Genbank record for genome ${genomeId}`)
+          const fmtStart = process.hrtime.bigint()
           const record = generateMergedGenbankRecord(genome, contigs, featuresByAccession)
+          const genFmt = msSince(fmtStart)
+          formatMs += genFmt
+          totalBytes += record.length
+          const wrStart = process.hrtime.bigint()
           await writeChunk(res, record)
+          const genWrite = msSince(wrStart)
+          writeMs += genWrite
           totalContigs++
+          timing(`genome ${genomeId} [merged]: fetchWait=${thisFetchWait.toFixed(0)}ms format=${genFmt.toFixed(0)}ms write=${genWrite.toFixed(0)}ms bytes=${record.length} contigs=${contigs.length}`)
         } else {
           // Multi-record mode: one record per contig
           debug(`Writing Genbank records for genome ${genomeId}`)
-          const contigCount = await writeGenbankMultiRecord(res, genome, contigs, featuresByAccession)
-          totalContigs += contigCount
+          const r = await writeGenbankMultiRecord(res, genome, contigs, featuresByAccession)
+          formatMs += r.formatMs
+          writeMs += r.writeMs
+          totalBytes += r.bytes
+          totalContigs += r.contigCount
+          timing(`genome ${genomeId}: fetchWait=${thisFetchWait.toFixed(0)}ms format=${r.formatMs.toFixed(0)}ms write=${r.writeMs.toFixed(0)}ms bytes=${r.bytes} contigs=${r.contigCount}`)
         }
       }
+
+      const totalMs = msSince(reqStart)
+      timing(`REQUEST SUMMARY ${genomeIds.length} genomes, ${totalContigs} contigs, ${(totalBytes / 1048576).toFixed(1)}MiB: ` +
+        `total=${totalMs.toFixed(0)}ms fetchWait=${fetchWaitMs.toFixed(0)}ms format=${formatMs.toFixed(0)}ms(CPU) write=${writeMs.toFixed(0)}ms(drain) ` +
+        `| format=${(100 * formatMs / totalMs).toFixed(1)}% write=${(100 * writeMs / totalMs).toFixed(1)}% fetchWait=${(100 * fetchWaitMs / totalMs).toFixed(1)}%`)
 
       if (totalContigs === 0) {
         if (!res.headersSent) {
