@@ -83,7 +83,7 @@ run_meter () {
 # Accept-Encoding: identity — no gzip, so pv byte counts map to real payload and
 #   the proxy can't buffer a compression window.
 # curl's -w summary goes to stderr via a second fd so it survives the pipe.
-curl -sS -N "${RATE_ARG[@]}" \
+curl -sS -N ${RATE_ARG[@]+"${RATE_ARG[@]}"} \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   -H 'Accept-Encoding: identity' \
   --data-raw "rql=${ENC_RQL}" \
