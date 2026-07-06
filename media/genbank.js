@@ -527,11 +527,21 @@ async function writeGenbankMultiRecord (res, genome, contigs, featuresByAccessio
  * (genome, then contigs+features) into one.
  */
 async function fetchGenomeData (genomeId) {
+  // Time each sub-fetch independently so a hang can be attributed to a specific
+  // collection (genome / genome_sequence / genome_feature) rather than the
+  // combined Promise.all wait.
+  const t0 = process.hrtime.bigint()
+  let gMs, cMs, fMs
   const [genome, contigs, featuresByAccession] = await Promise.all([
-    fetchGenome(genomeId),
-    fetchContigs(genomeId),
-    fetchFeatures(genomeId)
+    fetchGenome(genomeId).then((r) => { gMs = msSince(t0); return r }),
+    fetchContigs(genomeId).then((r) => { cMs = msSince(t0); return r }),
+    fetchFeatures(genomeId).then((r) => { fMs = msSince(t0); return r })
   ])
+  // Only log when something is slow enough to matter (avoids per-genome noise).
+  const slowest = Math.max(gMs, cMs, fMs)
+  if (slowest > 1000) {
+    timing(`fetchGenomeData ${genomeId} SLOW: genome=${gMs.toFixed(0)}ms genome_sequence=${cMs.toFixed(0)}ms genome_feature=${fMs.toFixed(0)}ms`)
+  }
   return { genome, contigs, featuresByAccession }
 }
 
