@@ -58,19 +58,31 @@ echo "RQL:   ${RQL:0:80}..."
 echo "Watch the pv line — a stall shows as [ 0 B/s] while the timer keeps going."
 echo
 
+# Interval (seconds) between pv status samples. Override: PV_INTERVAL=5 ...
+PV_INTERVAL="${PV_INTERVAL:-10}"
+
+# Meter: pv rewrites its status line in place every PV_INTERVAL seconds using a
+# carriage return. Piping pv's stderr through `tr '\r' '\n'` turns each in-place
+# update into a NEW scrolling line, so you get a timestamped history of how the
+# rate evolves over time instead of a single overwriting line.
+#   -b bytes  -t timer  -r recent rate (last window)  -a average rate (whole xfer)
+#   -f force meter even when stderr isn't a terminal (needed inside the pipe)
+# Watching both rates: `recent` dropping to 0 = a live stall; `average` low while
+# `recent` is healthy just means a slow start is still being averaged in.
+run_meter () {
+  if command -v pv >/dev/null; then
+    pv -bratf -i "$PV_INTERVAL" 2> >(tr '\r' '\n' >&2)
+  else
+    echo "(pv not found — falling back to cat; install pv for the live meter)" >&2
+    cat
+  fi
+}
+
 # -N/--no-buffer: hand bytes to the pipe as they arrive (don't buffer the body)
 # -sS: quiet but show errors
 # Accept-Encoding: identity — no gzip, so pv byte counts map to real payload and
 #   the proxy can't buffer a compression window.
-# Pipe the body through pv (rate/elapsed meter) into the output file.
 # curl's -w summary goes to stderr via a second fd so it survives the pipe.
-if command -v pv >/dev/null; then
-  METER="pv -bat -i 1"
-else
-  echo "(pv not found — falling back to cat; install pv for the live meter)"
-  METER="cat"
-fi
-
 curl -sS -N "${RATE_ARG[@]}" \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   -H 'Accept-Encoding: identity' \
@@ -78,7 +90,7 @@ curl -sS -N "${RATE_ARG[@]}" \
   -w 'CURLSUMMARY http_code=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s size=%{size_download} speed=%{speed_download}B/s connects=%{num_connects}\n' \
   "$URL" \
   2> >(grep CURLSUMMARY >&2) \
-  | $METER > "$OUT"
+  | run_meter > "$OUT"
 CURL_EXIT=${PIPESTATUS[0]}
 
 echo
