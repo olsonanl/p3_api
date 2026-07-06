@@ -326,12 +326,18 @@ function formatOrigin (sequence) {
  */
 function writeChunk (res, chunk) {
   return new Promise((resolve) => {
-    if (res.write(chunk)) {
-      resolve()
+    // If the client has already gone, don't write (and never wait for a 'drain'
+    // that will never fire on a dead socket — that was an infinite hang).
+    if (res.writableEnded || res.destroyed) {
+      resolve(false)
       return
     }
-    const onDrain = () => { cleanup(); resolve() }
-    const onClose = () => { cleanup(); resolve() }
+    if (res.write(chunk)) {
+      resolve(true)
+      return
+    }
+    const onDrain = () => { cleanup(); resolve(true) }
+    const onClose = () => { cleanup(); resolve(false) }
     const cleanup = () => {
       res.removeListener('drain', onDrain)
       res.removeListener('close', onClose)
@@ -480,8 +486,12 @@ async function writeGenbankMultiRecord (res, genome, contigs, featuresByAccessio
 
     record += buildOrigin(contig.sequence)
 
-    await writeChunk(res, record)
+    const ok = await writeChunk(res, record)
     contigCount++
+    if (!ok) {
+      // Client disconnected — stop writing this genome.
+      break
+    }
   }
 
   return contigCount
@@ -802,6 +812,13 @@ module.exports = {
         // iteration doesn't orphan it into an unhandled rejection. The real
         // await at the top of the next iteration still surfaces any error.
         if (nextFetch) nextFetch.catch(() => {})
+
+        // Stop early if the client has disconnected — no point fetching and
+        // formatting the remaining genomes into a dead socket.
+        if (res.writableEnded || res.destroyed) {
+          debug(`Client disconnected, stopping after ${i} genome(s)`)
+          break
+        }
 
         if (contigs.length === 0) {
           debug(`No sequence data found for genome ${genomeId}, skipping`)
