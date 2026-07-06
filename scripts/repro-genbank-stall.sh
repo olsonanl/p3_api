@@ -38,7 +38,10 @@ RATE="${2:-0}"
 RQL="${3:-in(genome_id,(470.36610,470.36611,470.36616,470.36618,470.36621,470.36635,470.36636,470.36637,470.36638,470.36639,470.36646,470.36647,470.36651,470.36652,470.36663,470.36665,470.36666,470.36667,470.36668,470.36669,470.36671,470.36672,470.36673,470.36674,470.36675,470.36676,470.36677,470.36678,470.36679,470.36680,470.36681,470.36682,470.36683,470.36684,470.36685,470.36686,470.36687,470.36688,470.36689,470.36690,470.36691,470.36692,470.36693,470.36694,470.36695,470.36696,470.36697,470.36698,470.36699,470.36700,470.36701,470.36702,470.36703,470.36704,470.36705,470.36706,470.36707,470.36708,470.36709,470.36710,470.36711,470.36712,470.36713,470.36714))&limit(2500000)}"
 
 OUT="/tmp/genbank-repro-$$.gbk"
-URL="${BASE_URL}/genome_feature/?http_download=true&http_accept=application/genbank"
+# GenBank downloads must target the genome collection (feature-level collections
+# are rejected by a guard and would stream millions of docs to recover the
+# genome_id list). The serializer fetches contigs/features per genome itself.
+URL="${BASE_URL}/genome/?http_download=true&http_accept=application/genbank"
 ENC_RQL=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$RQL")
 
 RATE_ARG=()
