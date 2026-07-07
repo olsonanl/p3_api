@@ -168,13 +168,21 @@ percentages — the tool that localized the root cause.
 
 ## Open items / follow-ups
 
-1. **Data-node network spike.** With the stall gone, a download now runs at full
-   speed, so the same sequence data ships from the shards ~15× faster — peak
-   data-node network jumped to 100–200 MB/s during a download. This is the same
-   data volume, no longer spread thin by the stall; the stall had been acting as
-   an *accidental* rate limiter. Concurrent fast downloads will now stack at full
-   speed. This raises the priority of deliberate Solr overload protection (see
-   `PLAN_SOLR_OVERLOAD_PROTECTION.md`).
+1. **Faster downloads raise peak shard network (general risk, not observed here).**
+   With the stall gone, a download runs at full speed, so the same sequence data
+   ships from the shards ~15× faster than when the stall was spreading it thin —
+   the stall had been acting as an *accidental* rate limiter, and concurrent fast
+   downloads will now stack at full speed. This raises the priority of deliberate
+   Solr overload protection (see `PLAN_SOLR_OVERLOAD_PROTECTION.md`).
+
+   Note: a 100–200 MB/s all-data-node network spike observed during this work was
+   initially suspected to be un-throttled download load, but was traced to
+   **scheduled backups** (direct node→network, bypassing HAProxy and the API).
+   Two 300s HAProxy stat snapshots taken during the spike showed the API moving
+   only ~4.3 MB/s total across both proxies (~0.1 req/s per frontend) — ~50×
+   below the node spike — confirming the API was not the source. Steady-state API
+   load through the proxies is very light; the old `maxconn 40` cap bit only on
+   bursts (e.g. concurrent large downloads pinning `smax=40`), not the baseline.
 
 2. **Concurrent-download CPU under PM2 cluster.** GenBank formatting is
    synchronous CPU (~170ms/genome, ~11s total per download). On a single worker,
