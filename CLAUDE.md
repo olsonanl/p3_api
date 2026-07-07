@@ -74,8 +74,9 @@ npm run build-image
 - **media/** - Response serializers by content type
   - JSON, CSV, TSV, Excel, FASTA (DNA/protein), GFF, Newick, GenBank
   - Auto-registered from filenames in `media/index.js`
-  - GenBank serializer (`genbank.js`) handles both query and streaming modes — extracts genome_ids from results, then fetches contigs/features per genome via direct Solr queries using the standard `Solrjs` client (not `DirectSolrClient` — see design note below)
+  - GenBank serializer (`genbank.js`) handles both query and streaming modes — extracts genome_ids from results, then fetches contigs/features per genome via direct Solr queries using the standard `Solrjs` client (not `DirectSolrClient` — see design note below). **GenBank downloads must target the `genome` collection** (see "GenBank downloads" below).
   - FASTA serializers (`dna+fasta.js`, `protein+fasta.js`) use `DirectSolrClient` + `SequenceJoinStream` for efficient sequence lookups with prefetch batching
+  - Serializers may declare `contentTypeAliases` (array) in addition to `contentType`; `media/index.js` registers each alias for the same serializer. Used so GFF answers to both `application/gff` and `text/gff3`/`text/x-gff3`.
   - **Design note — GenBank uses Solrjs, not DirectSolrClient**: GenBank's secondary fetches (genome metadata, contigs, features) are small targeted queries scoped to a single `genome_id`. They don't benefit from `DirectSolrClient`'s parallel shard fan-out, and `DirectSolrClient` requires `SolrClusterClient` for replica discovery which needs direct network access to every Solr replica. Using the standard `Solrjs` client (same as `APIMethodHandler`) means GenBank works through any Solr proxy URL — including on offsite laptops without VPN access to the on-prem cluster. FASTA serializers use `DirectSolrClient` because they join large streaming result sets with sequence data, where direct replica access and batched prefetch are worth the complexity.
 
 - **routes/** - Express routers
@@ -446,3 +447,43 @@ Joinable fields are configured per collection in `middleware/JoinEnrichment.js` 
 ### Future: Solr query cancellation
 
 Solr 9.6.1 supports task cancellation via `canCancel=true&queryUUID=<uuid>` on queries and `GET /solr/admin/tasks/cancel?queryUUID=<uuid>` to cancel. This could be used to cancel in-flight Solr queries when the browser disconnects (`req.on('close')`). See `solr-query-cancellation.md` for design details. **Not yet implemented** — the local join resolution and `timeAllowed` mitigations take priority. Cancellation is a general resource hygiene improvement for later.
+
+## GenBank Downloads
+
+GenBank export is served by `media/genbank.js`. Full investigation, diagnosis, and performance history: `Docs/GENBANK_DOWNLOAD_PERFORMANCE.md`.
+
+### Must target the `genome` collection
+
+Request GenBank from `/genome/`, not a feature-level collection:
+
+```
+GET /genome/?in(genome_id,(ID1,ID2,...))&http_download=true&http_accept=application/genbank
+```
+
+The serializer only needs the genome_id list from the query and fetches contigs/features per genome itself. Requesting from `genome_feature` would stream millions of feature docs just to recover the genome_id list. A guard in `routes/dataType.js` **rejects GenBank downloads on any non-`genome` collection with a 400** pointing at `/genome/`. Update client download links accordingly.
+
+### Streaming design
+
+- One record per contig (default) or a single merged record (`http_genbank_merged=true`).
+- Per-genome data is fetched in one parallel wave (`fetchGenomeData`: genome + contigs + features), and the next genome is prefetched while the current one is written (pipeline).
+- Writes honor `res.write` backpressure (`writeChunk` awaits `drain`) so memory stays bounded on slow clients; the loop stops on client disconnect (`res.destroyed`/`close`).
+- Sets `X-Accel-Buffering: no` so nginx doesn't re-buffer and defeat backpressure.
+
+### Solr fetch resilience (env-tunable)
+
+The per-genome Solr fetches have a request timeout + retry as a backstop against stale keepalive sockets (see the perf doc — the production stalls were traced to HAProxy `maxconn` shedding keepalive connections):
+
+- `GENBANK_SOLR_TIMEOUT_MS` (default 30000) — aborts a hung Solr request via `req.destroy`. Consider lowering to ~5000; a healthy fetch is ~400ms.
+- `GENBANK_SOLR_RETRIES` (default 1) — retry on a fresh connection after timeout.
+- `GENBANK_SOLR_KEEPALIVE=0` — give the fetches a non-keepAlive agent (diagnostic A/B).
+
+`Solrjs.query()` honors an optional `this.timeout` / `options.timeout` (added for this).
+
+### Diagnostics
+
+- `DEBUG=p3api-server:media:genbank:timing` — per-genome `fetchWait`/`format`/`write` ms plus a `REQUEST SUMMARY`. This is what localized the stall to Solr fetch wait.
+- `scripts/repro-genbank-stall.sh <base_url> [rate] [rql]` — curl+pv reproducer with per-interval rate log and a completeness check. **Test unthrottled** to see real stream behavior; `--rate` throttling makes curl the bottleneck and masks upstream stalls (use it only to simulate a slow client for backpressure tests).
+
+### Related infrastructure note
+
+The API reaches Solr through a pair of HAProxy load balancers (`p3.theseed.org:7001`), not directly. Keep HAProxy — it provides Solr coordinator health-checking and failover. A too-low HAProxy `global maxconn` was the root cause of the download stalls (it shed the API's keepalive sockets, which the API then hung on for ~166s with no timeout). See the perf doc for the full write-up.
