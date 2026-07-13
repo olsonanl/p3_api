@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BV-BRC API (p3api) is a Node.js/Express REST API providing access to BV-BRC bioinformatics data. It acts as a gateway to Solr backends, supporting RQL (Resource Query Language) and Solr query syntax.
 
+## Branch: feature/distributed-query — merge-review notes
+
+When assessing what this branch changes vs. upstream, **diff against `upstream/alpha`, not the git merge-base.** The merge-base (`223a99d3`) is stale and predates PRs already merged into alpha (PR #176 IDOR fix, SSRF sanitizer, JBrowse sanitization, numeric validation) — diffing the base over-counts the delta by showing already-shipped fixes as new. Those files (`SolrQuerySanitizer.js`, `JBrowse.js`, the `APIMethodHandler` IDOR filter) are identical to alpha.
+
+The one change in this branch that alters **preexisting shared-path behavior** (vs. new/leaf code) is the **streaming join-enrichment hook** in `APIMethodHandler.streamQuery` and `DistributedQuery` — it pipes streaming results through `JoinEnrichmentStream` whenever `req._joinSpecs` is set (any streaming download requesting a joinable field). Its setup is `try/catch`-guarded, but mid-stream errors are not; `JoinEnrichmentStream` is new to the shared path and untested there. Everything else in the branch is additive, guard-gated, a leaf serializer (`genbank.js`), or already in alpha. Against `upstream/master` the whole distributed-query + join subsystem is net-new. Full breakdown: `Docs/BRANCH_RISK_ANALYSIS.md`.
+
 ## Common Commands
 
 ```bash
