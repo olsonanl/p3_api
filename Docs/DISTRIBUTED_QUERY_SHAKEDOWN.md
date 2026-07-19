@@ -121,9 +121,21 @@ count/version drift, not ordering. This run positively re-confirms Defect C's fi
 
 - **Use `--ignore-order`** for unsorted queries (`in(...)` without `sort(...)`); Solr returns
   the same docs in a different order over time, producing benign positional diffs.
-- **Volatile fields** the replay tool does *not* currently ignore and that cause benign
-  diffs against a live DB: `_version_`, `date_inserted`, `numFound`, facet counts, and
-  `summary_by_taxon` aggregates. Consider adding `_version_` to the ignore list.
+- **Use `--inserted-before auto`** to eliminate the dominant source of drift — documents
+  ingested *after* the trace was captured. It appends a `date_inserted` upper bound to each
+  query (per-entry `ts`, falling back to the timestamp parsed from the log filename), so the
+  replay sees the same document set the original did. Verified: this restores exact
+  `numFound` and facet counts (e.g. acapria file1 went 4/20 → 13/20). It is applied only to
+  collections that carry `date_inserted` (a hardcoded allowlist; override with
+  `--inserted-before-collections`) and only to plain collection queries (not get-by-id or
+  `/data/…` computed endpoints). RQL colons are `%3A`-encoded because `:` is RQL's
+  type-converter separator.
+- **`_version_` is ignored** by the comparator now — it is Solr's internal
+  optimistic-concurrency stamp and changes on any (re)index, so it produced false diffs.
+- **Residual diffs that no filter can remove** (genuine data change, would differ on
+  `master` too): `taxonomy.genomes` denormalized counts, `summary_by_taxon` aggregates
+  (`CDS`, etc.), and docs *re-ingested* after capture (their own `date_inserted` value
+  shifts a few ms). These are correctly reported as real differences.
 - **Match the recorded `accept` header** when hand-testing — genome+facet requests used
   `application/solr+json` (raw Solr object), not `application/json` (bare docs array).
 - The `X-Distributed-Query` response header (when `exposeMetadataHeaders` is on) is the
@@ -133,5 +145,7 @@ count/version drift, not ordering. This run positively re-confirms Defect C's fi
 
 - The taxonomy `lineage_ids` and all acapria diffs are data/time drift, not code — they
   would reproduce on `master`. No action needed for the branch.
-- Optional replay-tool improvement: ignore `_version_` (and optionally `date_inserted`)
-  to reduce false positives against a live database.
+- Replay-tool improvements landed after the initial runs: `--inserted-before` (date bound),
+  `_version_` ignored, and `params.q`/`params.fq` echo ignored when a date bound is applied.
+  Re-running the drift-heavy traces with `--inserted-before auto --ignore-order` reduces the
+  failures to the genuine-data-change residuals listed under Methodology.

@@ -27,9 +27,30 @@ if (args.help || !args.logFile || !args.endpoint) {
   console.log('  --output <file>       Write detailed results to JSONL file');
   console.log('  --ignore-order        Ignore array element order in JSON comparison');
   console.log('  --max <n>             Stop after n queries');
+  console.log('  --inserted-before <d> Constrain queries to docs with date_inserted before <d>');
+  console.log('                        (ISO date, or "auto" to use each entry\'s recorded ts,');
+  console.log('                        falling back to the timestamp in the log filename).');
+  console.log('                        Eliminates drift from documents ingested after capture.');
+  console.log('                        Only applied to collections that have date_inserted.');
+  console.log('  --inserted-before-collections <csv>');
+  console.log('                        Override the default allowlist of collections that carry');
+  console.log('                        date_inserted (comma-separated).');
   console.log('  --help                Show this help');
   process.exit(args.help ? 0 : 1);
 }
+
+// Collections known to carry a date_inserted field. Injecting a date_inserted
+// bound into a collection that lacks it (e.g. taxonomy, a reference collection)
+// makes Solr error, so we only constrain these. Override with
+// --inserted-before-collections. Verified present via the schema on 2026-07-18.
+var DEFAULT_DATE_INSERTED_COLLECTIONS = [
+  'genome', 'genome_feature', 'genome_sequence', 'genome_amr', 'sp_gene',
+  'pathway', 'subsystem', 'feature_sequence', 'protein_feature',
+  'antibiotics', 'bioset', 'experiment'
+];
+
+var dateInsertedCollections = args.insertedBeforeCollections || DEFAULT_DATE_INSERTED_COLLECTIONS;
+var filenameCutoff = args.logFile ? dateFromFilename(args.logFile) : null;
 
 var stats = {
   total: 0,
@@ -61,6 +82,14 @@ async function run() {
   var entries = await loadEntries(args.logFile);
   console.log('Loaded ' + entries.length + ' replayable queries from ' + args.logFile);
   console.log('Target: ' + args.endpoint);
+  if (args.insertedBefore) {
+    if (args.insertedBefore === 'auto') {
+      console.log('date_inserted bound: per-entry ts (fallback: ' + (filenameCutoff || 'none') + ')');
+    } else {
+      console.log('date_inserted bound: ' + args.insertedBefore);
+    }
+    console.log('  applied to collections: ' + dateInsertedCollections.join(', '));
+  }
   console.log('');
 
   if (args.concurrency > 1) {
@@ -142,12 +171,15 @@ async function replayOne(entry, idx, total) {
     reqOpts.headers['Authorization'] = args.token;
   }
 
+  var aug = augmentQuery(entry);
+  var queryStr = aug.query;
+
   var body = null;
-  if (entry.method === 'POST' && entry.query) {
-    body = entry.query;
+  if (entry.method === 'POST' && queryStr) {
+    body = queryStr;
     reqOpts.headers['Content-Length'] = Buffer.byteLength(body);
-  } else if (entry.method === 'GET' && entry.query) {
-    reqOpts.path += (reqOpts.path.indexOf('?') === -1 ? '?' : '&') + entry.query;
+  } else if (entry.method === 'GET' && queryStr) {
+    reqOpts.path += (reqOpts.path.indexOf('?') === -1 ? '?' : '&') + queryStr;
   }
 
   var startTime = Date.now();
@@ -171,6 +203,10 @@ async function replayOne(entry, idx, total) {
       match: comparison.match,
       diff: comparison.diff
     };
+
+    if (aug.cutoff) {
+      record.insertedBefore = aug.cutoff;
+    }
 
     stats.totalOriginalMs += entry.elapsed || 0;
     stats.totalReplayMs += elapsed;
@@ -208,6 +244,51 @@ async function replayOne(entry, idx, total) {
       }) + '\n');
     }
   }
+}
+
+// Derive an ISO timestamp from a query-log filename like
+// "user@host-2026-07-16T18-16-28-487Z.jsonl" -> "2026-07-16T18:16:28.487Z".
+function dateFromFilename(filePath) {
+  var base = String(filePath).split('/').pop();
+  var m = base.match(/(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/);
+  if (!m) return null;
+  return m[1] + 'T' + m[2] + ':' + m[3] + ':' + m[4] + '.' + m[5] + 'Z';
+}
+
+// Extract the collection (first path segment) and full segment list from a path.
+function collectionForPath(path) {
+  var p = String(path || '').split('?')[0].replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!p) return { collection: null, segments: [] };
+  var segments = p.split('/');
+  return { collection: segments[0], segments: segments };
+}
+
+// Optionally append a date_inserted upper bound to a query so the replay sees the
+// same document set the original capture did (no post-capture ingestion). Returns
+// { query, cutoff } — cutoff is set only when a bound was actually applied.
+function augmentQuery(entry) {
+  var q = entry.query || '';
+  if (!args.insertedBefore) return { query: q, cutoff: null };
+
+  var info = collectionForPath(entry.path);
+  // Only constrain a plain collection query (e.g. /genome/), not get-by-id
+  // (/genome/123) or computed endpoints (/data/summary_by_taxon/..).
+  if (!info.collection || info.segments.length !== 1) return { query: q, cutoff: null };
+  if (dateInsertedCollections.indexOf(info.collection) === -1) return { query: q, cutoff: null };
+
+  var cutoff = (args.insertedBefore === 'auto')
+    ? (entry.ts || filenameCutoff)
+    : args.insertedBefore;
+  if (!cutoff) return { query: q, cutoff: null };
+
+  var isSolr = (entry.contentType || '').indexOf('solr') !== -1;
+  var clause = isSolr
+    ? 'fq=date_inserted:[* TO ' + cutoff + ']'
+    // RQL treats ':' as a type-converter separator, so encode the colons in the
+    // datetime value (verified: %3A round-trips to the intended Solr range).
+    : 'lt(date_inserted,' + cutoff.replace(/:/g, '%3A') + ')';
+
+  return { query: q ? q + '&' + clause : clause, cutoff: cutoff };
 }
 
 function makeRequest(mod, opts, body) {
@@ -283,8 +364,19 @@ var IGNORE_PATHS = [
   'responseHeader.params.NOW',
   'responseHeader.params.appRid',
   'response.maxScore',
-  'responseHeader.params.shards.preference'
+  'responseHeader.params.shards.preference',
+  // Solr's internal optimistic-concurrency version stamp. It changes on every
+  // (re)index of a document and carries no user-facing meaning, so it produces
+  // false diffs against a live cluster even for unchanged documents.
+  '_version_'
 ];
+
+// When we deliberately append a date_inserted bound (--inserted-before), the
+// echoed request query in responseHeader.params legitimately differs from the
+// original. The actual result data is still compared, so ignore only the echo.
+if (args.insertedBefore) {
+  IGNORE_PATHS.push('responseHeader.params.q', 'responseHeader.params.fq');
+}
 
 function shouldIgnore(path) {
   for (var i = 0; i < IGNORE_PATHS.length; i++) {
@@ -436,6 +528,8 @@ function parseArgs(argv) {
     output: null,
     ignoreOrder: false,
     max: 0,
+    insertedBefore: null,
+    insertedBeforeCollections: null,
     help: false
   };
 
@@ -450,6 +544,10 @@ function parseArgs(argv) {
       case '--output': result.output = argv[++i]; break;
       case '--ignore-order': result.ignoreOrder = true; break;
       case '--max': result.max = parseInt(argv[++i], 10) || 0; break;
+      case '--inserted-before': result.insertedBefore = argv[++i]; break;
+      case '--inserted-before-collections':
+        result.insertedBeforeCollections = argv[++i].split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+        break;
       case '--help': case '-h': result.help = true; break;
       default:
         if (argv[i].startsWith('-')) {
