@@ -35,6 +35,11 @@ if (args.help || !args.logFile || !args.endpoint) {
   console.log('  --inserted-before-collections <csv>');
   console.log('                        Override the default allowlist of collections that carry');
   console.log('                        date_inserted (comma-separated).');
+  console.log('  --compare <url>       Live A/B mode: send each query to both <api-endpoint>');
+  console.log('                        and <url> at the same instant and compare the two');
+  console.log('                        responses to each other (the recorded response is');
+  console.log('                        ignored). Use to diff a test server vs production on');
+  console.log('                        identical live data. Combine with --ignore-order.');
   console.log('  --help                Show this help');
   process.exit(args.help ? 0 : 1);
 }
@@ -82,6 +87,10 @@ async function run() {
   var entries = await loadEntries(args.logFile);
   console.log('Loaded ' + entries.length + ' replayable queries from ' + args.logFile);
   console.log('Target: ' + args.endpoint);
+  if (args.compare) {
+    console.log('Compare (live A/B) against: ' + args.compare);
+    console.log('  (recorded responses ignored; comparing the two live servers)');
+  }
   if (args.insertedBefore) {
     if (args.insertedBefore === 'auto') {
       console.log('date_inserted bound: per-entry ts (fallback: ' + (filenameCutoff || 'none') + ')');
@@ -143,14 +152,13 @@ function loadEntries(filePath) {
   });
 }
 
-async function replayOne(entry, idx, total) {
-  stats.total++;
-  var targetUrl = args.endpoint.replace(/\/+$/, '') + entry.path;
+// Build the request (module, options, body) for a given base URL and query.
+function buildRequest(baseUrl, entry, queryStr) {
+  var targetUrl = baseUrl.replace(/\/+$/, '') + entry.path;
   var parsed = new URL(targetUrl);
   var isHttps = parsed.protocol === 'https:';
-  var mod = isHttps ? https : http;
 
-  var reqOpts = {
+  var opts = {
     hostname: parsed.hostname,
     port: parsed.port || (isHttps ? 443 : 80),
     path: parsed.pathname + parsed.search,
@@ -163,39 +171,57 @@ async function replayOne(entry, idx, total) {
     timeout: args.timeout
   };
 
-  if (entry.range) {
-    reqOpts.headers['Range'] = entry.range;
-  }
-
-  if (args.token) {
-    reqOpts.headers['Authorization'] = args.token;
-  }
-
-  var aug = augmentQuery(entry);
-  var queryStr = aug.query;
+  if (entry.range) opts.headers['Range'] = entry.range;
+  if (args.token) opts.headers['Authorization'] = args.token;
 
   var body = null;
   if (entry.method === 'POST' && queryStr) {
     body = queryStr;
-    reqOpts.headers['Content-Length'] = Buffer.byteLength(body);
+    opts.headers['Content-Length'] = Buffer.byteLength(body);
   } else if (entry.method === 'GET' && queryStr) {
-    reqOpts.path += (reqOpts.path.indexOf('?') === -1 ? '?' : '&') + queryStr;
+    opts.path += (opts.path.indexOf('?') === -1 ? '?' : '&') + queryStr;
   }
 
+  return { mod: isHttps ? https : http, opts: opts, body: body };
+}
+
+async function replayOne(entry, idx, total) {
+  stats.total++;
+
+  var aug = augmentQuery(entry);
+  var queryStr = aug.query;
+
+  var primary = buildRequest(args.endpoint, entry, queryStr);
   var startTime = Date.now();
 
   try {
-    var result = await makeRequest(mod, reqOpts, body);
+    // In --compare mode, hit both endpoints concurrently (same instant, same
+    // live Solr) and compare them to each other; the recorded response is not
+    // used. Otherwise compare the single endpoint against the recorded response.
+    var result, refBody, refStatus, comparison;
+    if (args.compare) {
+      var reference = buildRequest(args.compare, entry, queryStr);
+      var both = await Promise.all([
+        makeRequest(primary.mod, primary.opts, primary.body),
+        makeRequest(reference.mod, reference.opts, reference.body)
+      ]);
+      result = both[0];
+      refBody = both[1].body;
+      refStatus = both[1].statusCode;
+      comparison = compareResponses(refBody, result.body, entry.accept);
+    } else {
+      result = await makeRequest(primary.mod, primary.opts, primary.body);
+      refStatus = entry.status;
+      comparison = compareResponses(entry.response, result.body, entry.accept);
+    }
     var elapsed = Date.now() - startTime;
-
-    var comparison = compareResponses(entry.response, result.body, entry.accept);
 
     var record = {
       idx: idx,
       path: entry.path,
       method: entry.method,
       query: truncate(entry.query, 120),
-      originalStatus: entry.status,
+      originalStatus: refStatus,
       replayStatus: result.statusCode,
       originalMs: entry.elapsed,
       replayMs: elapsed,
@@ -215,7 +241,7 @@ async function replayOne(entry, idx, total) {
       record.note = comparison.note;
     }
 
-    if (comparison.match && result.statusCode === entry.status) {
+    if (comparison.match && result.statusCode === refStatus) {
       stats.passed++;
       if (!args.failOnly && !args.summary) {
         printResult(comparison.note ? 'SKIP' : 'PASS', record, idx, total);
@@ -368,15 +394,16 @@ var IGNORE_PATHS = [
   // Solr's internal optimistic-concurrency version stamp. It changes on every
   // (re)index of a document and carries no user-facing meaning, so it produces
   // false diffs against a live cluster even for unchanged documents.
-  '_version_'
+  '_version_',
+  // Echoes of the request query. These reflect how RQL was translated to Solr,
+  // which differs cosmetically across server versions/config (e.g. a keyword
+  // clause echoed as "text:235" vs "235" — same default field, same matches) and
+  // legitimately changes when --inserted-before appends a date bound. Any
+  // result-affecting difference surfaces under response.* (compared first), so
+  // ignoring the echo never hides a real data difference.
+  'responseHeader.params.q',
+  'responseHeader.params.fq'
 ];
-
-// When we deliberately append a date_inserted bound (--inserted-before), the
-// echoed request query in responseHeader.params legitimately differs from the
-// original. The actual result data is still compared, so ignore only the echo.
-if (args.insertedBefore) {
-  IGNORE_PATHS.push('responseHeader.params.q', 'responseHeader.params.fq');
-}
 
 function shouldIgnore(path) {
   for (var i = 0; i < IGNORE_PATHS.length; i++) {
@@ -530,6 +557,7 @@ function parseArgs(argv) {
     max: 0,
     insertedBefore: null,
     insertedBeforeCollections: null,
+    compare: null,
     help: false
   };
 
@@ -548,6 +576,7 @@ function parseArgs(argv) {
       case '--inserted-before-collections':
         result.insertedBeforeCollections = argv[++i].split(',').map(function (s) { return s.trim(); }).filter(Boolean);
         break;
+      case '--compare': result.compare = argv[++i]; break;
       case '--help': case '-h': result.help = true; break;
       default:
         if (argv[i].startsWith('-')) {

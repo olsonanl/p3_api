@@ -26,6 +26,9 @@ after the fixes (`X-Distributed-Query` absent on all of them).
 
 Distributed unit suite: **155 passing** (includes new regression tests).
 
+A follow-up **live A/B comparison** (branch vs production, same instant, same Solr) then
+confirmed the branch returns identical results to production — see that section below.
+
 ## Defects found and fixed
 
 All fixes are in commit `6a779f61` ("Fix distributed-query streaming defects found in
@@ -117,6 +120,46 @@ count/version drift, not ordering. This run positively re-confirms Defect C's fi
 `facet(...)` queries all took the standard path and returned computed `facet_counts`
 (only the counts differ, not the shape).
 
+## Live A/B comparison (test vs production)
+
+The recorded-replay approach is limited by data drift: the database changes between capture
+and replay. A stronger test sends each query to **both** the test server (this branch) and
+**production** at the same instant, against the same live Solr, and compares the two
+responses to each other — isolating *code* differences from time drift. Production has no
+distributed-query subsystem, so this directly answers: *does the distributed path return the
+same results as production's standard path?*
+
+Implemented as `--compare <url>` in the replay tool:
+
+```
+node scripts/replay-queries.js <trace.jsonl> http://localhost:23001 \
+  --compare https://www.bv-brc.org/api --token "$(cat token.<user>)" --ignore-order --summary
+```
+
+Results (branch on `localhost:23001` vs production `www.bv-brc.org/api`):
+
+| Trace | A/B result | Non-matches |
+|-------|-----------|-------------|
+| ARWattam   | 456/456 | — |
+| nbowers    | 66/68   | 2× `date_inserted` differing 6-9 ms on one doc |
+| acapria    | 53/60   | 7× `date_inserted` differing 6-9 ms on one doc |
+| chrescobar | 5/5     | (1 transient on an earlier run; 5/5 on 3 re-runs) |
+
+**Every non-match is SolrCloud replica inconsistency, not branch code** (see
+`REPLICATION_LAG.md`): the two servers route to different replicas, and a doc's
+`date_inserted` (or, once, a `genome_feature` doc's optional field set) differs slightly
+between replicas that were indexed independently. These are non-deterministic — the
+chrescobar difference vanished on re-run once a consistent replica was hit.
+
+The initial A/B run also surfaced 45 `responseHeader.params.q` differences: production echoes
+a keyword clause as `text:235` while the branch's inlined solrjs echoes bare `235` (same
+default field, same matches). Because the comparator checks `response` before
+`responseHeader`, these were confirmed cosmetic (the docs already matched), and the echoed
+query params (`params.q`/`params.fq`) are now ignored by the comparator.
+
+Conclusion: on identical live data, the distributed-query branch is result-identical to
+production across all four user workloads; the only differences are cluster replica drift.
+
 ## Methodology notes (for future replays)
 
 - **Use `--ignore-order`** for unsorted queries (`in(...)` without `sort(...)`); Solr returns
@@ -130,8 +173,11 @@ count/version drift, not ordering. This run positively re-confirms Defect C's fi
   `--inserted-before-collections`) and only to plain collection queries (not get-by-id or
   `/data/…` computed endpoints). RQL colons are `%3A`-encoded because `:` is RQL's
   type-converter separator.
-- **`_version_` is ignored** by the comparator now — it is Solr's internal
-  optimistic-concurrency stamp and changes on any (re)index, so it produced false diffs.
+- **`_version_` and the query echo (`responseHeader.params.q`/`.fq`) are ignored** by the
+  comparator. `_version_` is Solr's internal optimistic-concurrency stamp (changes on any
+  re-index); the `params.q`/`.fq` echoes reflect cosmetic RQL→Solr translation differences
+  across server versions. Any result-affecting difference surfaces under `response.*`
+  (compared first), so ignoring these never hides a real data difference.
 - **Residual diffs that no filter can remove** (genuine data change, would differ on
   `master` too): `taxonomy.genomes` denormalized counts, `summary_by_taxon` aggregates
   (`CDS`, etc.), and docs *re-ingested* after capture (their own `date_inserted` value
@@ -146,6 +192,7 @@ count/version drift, not ordering. This run positively re-confirms Defect C's fi
 - The taxonomy `lineage_ids` and all acapria diffs are data/time drift, not code — they
   would reproduce on `master`. No action needed for the branch.
 - Replay-tool improvements landed after the initial runs: `--inserted-before` (date bound),
-  `_version_` ignored, and `params.q`/`params.fq` echo ignored when a date bound is applied.
-  Re-running the drift-heavy traces with `--inserted-before auto --ignore-order` reduces the
-  failures to the genuine-data-change residuals listed under Methodology.
+  `--compare` (live A/B against a second endpoint), and ignoring `_version_` and the
+  `params.q`/`params.fq` query echo. Re-running the drift-heavy traces with
+  `--inserted-before auto --ignore-order`, or with `--compare` against production, reduces
+  the failures to the genuine-data-change / replica-drift residuals listed above.
