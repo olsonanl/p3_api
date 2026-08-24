@@ -18,6 +18,7 @@ var dataRouter = require('./routes/dataRouter')
 var indexer = require('./routes/indexer')
 var docRouter = require('./routes/documentation')
 var indexRouter = require('./routes/index')
+var distributedQueryRouter = require('./routes/distributedQueryRouter')
 var pkgJSON = require("./package.json");
 var sleep = require("sleep-promise");
 
@@ -199,6 +200,10 @@ app.use('/permissions/genome', [
   genomePermissionRouter
 ])
 
+app.use('/test/distributed-query', [
+  distributedQueryRouter
+])
+
 app.use('/:dataType/', [
   dataTypeRouter
 ])
@@ -217,6 +222,18 @@ app.use(function (req, res, next) {
 
 // Handle errors
 app.use(function (error, req, res, next) {
+  // If the response has already started (e.g. a streaming/distributed download
+  // that failed mid-stream), we cannot change status or set headers. Setting a
+  // header here throws ERR_HTTP_HEADERS_SENT; instead abort the socket so the
+  // client sees a truncated/failed transfer rather than a silent 200.
+  if (res.headersSent) {
+    console.error(`Error after headers sent (${req.method} ${req.originalUrl}): ${error && error.message}`)
+    // Abort the socket with NO error argument. Passing the error re-emits it on
+    // res, producing a secondary "socket hang up" uncaughtException; we only want
+    // to sever the connection so the client sees a truncated transfer.
+    try { res.destroy() } catch (e) { /* already torn down */ }
+    return
+  }
   res.setHeader('Content-Type', 'application/json')
   res.status(error.status || 500)
   res.send({

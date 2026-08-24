@@ -1,4 +1,4 @@
-const Solrjs = require('solrjs')
+const Solrjs = require('../lib/solrjs')
 const Config = require('../config')
 const SOLR_URL = Config.get('solr').url
 const debug = require('debug')('p3api-server:middleware/APIMethodHandler')
@@ -12,6 +12,12 @@ function streamQuery (req, res, next) {
     return next()
   }
 
+  // Skip if distributed query already handled this request
+  if (req.skipAPIMethodHandler && res.results) {
+    debug('Skipping streamQuery - handled by distributed query')
+    return next()
+  }
+
   const query = req.call_params[0]
   const solrClient = new Solrjs(SOLR_URL + '/' + req.call_collection)
   solrClient.setAgent(solrAgent)
@@ -22,7 +28,29 @@ function streamQuery (req, res, next) {
   debug('streamSOLR() query: ', query)
 
   solrClient.stream(query)
-    .then((results) => {
+    .then(async (results) => {
+      // Pipe through join enrichment stream if join specs were prepared
+      if (req._joinSpecs && req._joinSpecs.length > 0 && results.stream) {
+        try {
+          const JoinEnrichmentStream = require('../lib/distributed/JoinEnrichmentStream')
+          const { getJoiner } = require('./JoinEnrichment')
+          const joiner = await getJoiner()
+
+          const joinStream = new JoinEnrichmentStream(joiner, {
+            joinSpecs: req._joinSpecs,
+            batchSize: 50,
+            skipHeader: true, // Solrjs stream emits metadata header first
+            user: req.user,
+            publicFree: req.publicFree
+          })
+
+          results.stream = results.stream.pipe(joinStream)
+          debug('Piped stream through JoinEnrichmentStream')
+        } catch (err) {
+          debug(`Failed to set up stream join enrichment: ${err.message}`)
+        }
+      }
+
       res.results = results
       next()
     }, (err) => {
@@ -33,6 +61,12 @@ function streamQuery (req, res, next) {
 
 function querySOLR (req, res, next) {
   if (req.call_method !== 'query') {
+    return next()
+  }
+
+  // Skip if distributed query already handled this request
+  if (req.skipAPIMethodHandler && res.results) {
+    debug('Skipping querySOLR - handled by distributed query')
     return next()
   }
 
