@@ -32,6 +32,11 @@ const defaults = {
     'pathway_ref',
     'ppi',
     'pig',
+    // Private per-genome metadata. Uses the standard owner/user_read/user_write/public
+    // triple, so DecorateQuery + lib/permissionFilter scope it with no special handling.
+    // Deliberately NOT in publicFree (middleware/PublicDataTypes.js) and deliberately NOT
+    // in genomeCoresUUIDs (routes/genomePermissionRouter.js) — see the note there.
+    'private_genome_metadata',
     'protein_family_ref',
     'sequence_feature',
     'sequence_feature_vt',
@@ -120,6 +125,9 @@ const defaults = {
     pathway: 'id',
     pathway_ref: 'id',
     ppi: 'id',
+    // uniqueKey is a UUID, not genome_id — one genome may carry several metadata
+    // records (verified against the live schema).
+    private_genome_metadata: 'id',
     protein_family_ref: 'family_id',
     protein_feature: 'id',
     protein_structure: 'pdb_id',
@@ -147,6 +155,85 @@ const defaults = {
     },
     subsystem: {
       preference: 'replica.type:PULL,replica.type:TLOG'
+    }
+  },
+
+  distributedQuery: {
+    // Integration settings - controls when distributed queries are used
+    enabled: true,
+    minLimitThreshold: 10000,
+    enabledCollections: ['genome_feature'], // Start with just genome_feature
+    disabledCollections: [],
+    exposeMetadataHeaders: true,
+
+    // Maximum concurrent shard queries
+    maxParallelism: 8,
+
+    // Retry configuration
+    maxRetries: 3,
+    initialRetryDelayMs: 100,
+
+    // Cache TTLs
+    schemaCacheTTLMinutes: 60,
+    clusterStatusCacheTTLSeconds: 60,
+
+    // Memory limits
+    maxMergeSortHeapDocs: 10000,
+    maxMemoryMB: 32,
+
+    // Batch size for cursor pagination
+    cursorBatchSize: 2000,
+
+    // Node exclusion patterns (regex strings)
+    excludeNodes: [],
+
+    // Admin users who can modify runtime config
+    adminUsers: []
+  },
+
+  // Join enrichment for paginated queries
+  // Adds fields from related collections when explicitly requested via select()
+  joinEnrichment: {
+    enabled: true,
+    cacheSize: 200, // LRU cache size per target collection
+    collections: {
+      // genome_feature can fetch genome metadata
+      genome_feature: {
+        joinableFields: {
+          genome_name: { from: 'genome', via: 'genome_id', field: 'genome_name' },
+          taxon_id: { from: 'genome', via: 'genome_id', field: 'taxon_id' },
+          genome_status: { from: 'genome', via: 'genome_id', field: 'genome_status' },
+          strain: { from: 'genome', via: 'genome_id', field: 'strain' }
+        }
+      },
+      // pathway can fetch genome metadata
+      pathway: {
+        joinableFields: {
+          genome_name: { from: 'genome', via: 'genome_id', field: 'genome_name' },
+          taxon_id: { from: 'genome', via: 'genome_id', field: 'taxon_id' }
+        }
+      },
+      // subsystem can fetch genome metadata
+      subsystem: {
+        joinableFields: {
+          genome_name: { from: 'genome', via: 'genome_id', field: 'genome_name' },
+          taxon_id: { from: 'genome', via: 'genome_id', field: 'taxon_id' }
+        }
+      },
+      // sp_gene can fetch genome metadata
+      sp_gene: {
+        joinableFields: {
+          genome_name: { from: 'genome', via: 'genome_id', field: 'genome_name' },
+          taxon_id: { from: 'genome', via: 'genome_id', field: 'taxon_id' }
+        }
+      },
+      // genome_amr can fetch genome metadata
+      genome_amr: {
+        joinableFields: {
+          genome_name: { from: 'genome', via: 'genome_id', field: 'genome_name' },
+          taxon_id: { from: 'genome', via: 'genome_id', field: 'taxon_id' }
+        }
+      }
     }
   }
 
