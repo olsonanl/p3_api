@@ -7,6 +7,44 @@ const Web = require('../web');
 
 var solrAgent = Web.getSolrAgent();
 
+// Request timeout for every Solr call on the main data path.
+//
+// The pooled agent is keepAlive, so Node can hand a request a socket the far side
+// (HAProxy, per Docs/GENBANK_DOWNLOAD_PERFORMANCE.md) has already dropped. A silent
+// LB drop leaves no FIN, so the socket looks alive and cannot be probed before use;
+// the request is written into a dead connection and waits for the OS to tear down
+// the TCP session — measured at ~166s. Cloudflare's 100s origin limit fires long
+// before that, so the user gets a 524 while the worker is still holding one of the
+// agent's `maxSockets` slots.
+//
+// This timer is the detection mechanism: it turns a multi-minute hang into a prompt
+// error, frees the socket slot, and lets the client retry against a fresh connection.
+// The symptom it addresses is intermittent — a query that hangs once and succeeds on
+// reload is landing on a stale socket, not doing more work.
+//
+// Set SOLR_REQUEST_TIMEOUT_MS=0 to disable (restores the previous hang-forever
+// behavior). Default 120000: comfortably above the slowest legitimate query observed
+// in production (~75s Solr time on broad facet queries) so it never truncates real
+// work, while still well under Cloudflare's limit for the common case.
+const SOLR_REQUEST_TIMEOUT_MS = process.env.SOLR_REQUEST_TIMEOUT_MS !== undefined
+  ? parseInt(process.env.SOLR_REQUEST_TIMEOUT_MS, 10)
+  : 120000
+
+// Build a Solr client for `collection` with the shared pooled agent, the request
+// timeout, and the authenticated-user header applied consistently. Every Solr call
+// in this module goes through here so no path can silently miss the timeout.
+function makeSolrClient (collection, user) {
+  const solrClient = new Solrjs(SOLR_URL + '/' + collection)
+  solrClient.setAgent(solrAgent)
+  if (SOLR_REQUEST_TIMEOUT_MS) {
+    solrClient.timeout = SOLR_REQUEST_TIMEOUT_MS
+  }
+  if (user) {
+    solrClient.setHeaders({ 'X-Authenticated-User': user })
+  }
+  return solrClient
+}
+
 function streamQuery (req, res, next) {
   if (req.call_method !== 'stream') {
     return next()
@@ -19,11 +57,7 @@ function streamQuery (req, res, next) {
   }
 
   const query = req.call_params[0]
-  const solrClient = new Solrjs(SOLR_URL + '/' + req.call_collection)
-  solrClient.setAgent(solrAgent)
-  if (req.user) {
-    solrClient.setHeaders({"X-Authenticated-User": req.user});
-  }
+  const solrClient = makeSolrClient(req.call_collection, req.user)
 
   debug('streamSOLR() query: ', query)
 
@@ -72,11 +106,7 @@ function querySOLR (req, res, next) {
 
   const query = req.call_params[0]
   const url = SOLR_URL + '/' + req.call_collection;
-  const solrClient = new Solrjs(url)
-  solrClient.setAgent(solrAgent)
-  if (req.user) {
-    solrClient.setHeaders({"X-Authenticated-User": req.user});
-  }
+  const solrClient = makeSolrClient(req.call_collection, req.user)
 
   debug('querySOLR() query: ', query)
 
@@ -108,11 +138,7 @@ function querySOLR (req, res, next) {
 }
 
 function getSOLR (req, res, next) {
-  const solrClient = new Solrjs(SOLR_URL + '/' + req.call_collection)
-  solrClient.setAgent(solrAgent)
-  if (req.user) {
-    solrClient.setHeaders({"X-Authenticated-User": req.user});
-  }
+  const solrClient = makeSolrClient(req.call_collection, req.user)
 
   solrClient.get(req.call_params[0])
     .then((sresults) => {
@@ -164,8 +190,7 @@ function getSOLR (req, res, next) {
 }
 
 function getSchema (req, res, next) {
-  const solrClient = new Solrjs(SOLR_URL + '/' + req.call_collection)
-  solrClient.setAgent(solrAgent)
+  const solrClient = makeSolrClient(req.call_collection)
 
   solrClient.getSchema()
     .then((body) => {
