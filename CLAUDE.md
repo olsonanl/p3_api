@@ -6,27 +6,48 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BV-BRC API (p3api) is a Node.js/Express REST API providing access to BV-BRC bioinformatics data. It acts as a gateway to Solr backends, supporting RQL (Resource Query Language) and Solr query syntax.
 
-## Branch state (2026-08-20)
+## Branch state (2026-08-25)
 
-**`feature/distributed-query` is MERGED into `upstream/alpha`** — PR #189, merge commit
-`be1b75aa`. The distributed-query, join-enrichment, and cross-collection-download subsystems
-are now alpha baseline, not branch-local. Historical reports (`Docs/ALPHA_MERGE_REPORT.md`,
-`Docs/ALPHA_PR_BODY.md`, `Docs/ALPHA_MERGE_REPORT_SLACK.txt`, `Docs/BRANCH_RISK_ANALYSIS.md`)
-describe that pre-merge delta and are kept for provenance only.
+**alpha and master are converged; master is now ahead.** The long-standing
+"master is ~175 commits behind alpha" situation is **resolved** — do not act on older notes
+saying otherwise.
 
-**`upstream/master` is ~175 commits behind alpha** and does not have any of it. Master *does*
-carry the same dependency-security work under different hashes (verified: `p3-user`, `forever`,
-`npm`, `install`, `uuid`, `ejs`, `nconf`, `nodemailer`, `apicache` are identical on both lines),
-so an alpha→master merge should be conflict-free on those files. Master has no `CLAUDE.md`, so
-this file arrives there as a new file rather than a conflict.
+- **PR #202** (`bf9c9207`) merged alpha → master, bringing the distributed-query,
+  join-enrichment, and cross-collection-download subsystems (originally #189, `be1b75aa`)
+  onto master.
+- **PR #203** (`6397c6cf`) added a Solr request timeout on the main data path.
+- **`upstream/master` is now 14 commits AHEAD of `upstream/alpha`, 0 behind.** Alpha can be
+  fast-forwarded to match; there is nothing to merge back.
 
-Offline-suite baseline on alpha is now **327 passing / 1 failing** — the known
-`fastaHeaderFormatter` case. (It was 247/2 before the merge; the extra suites came with #189,
-and alpha no longer hits the old `test.config.spec.js` failure because the config keys that
-test expects are the ones #189 added.)
+Merge-resolution notes worth keeping: the only conflicts were `package.json` and
+`package-lock.json`, and `package.json` was resolved **in alpha's favour on all four
+differing lines** — keep the inlined `lib/solrjs`, keep `dojo-declare`, keep the two test
+scripts, and **do not restore the external `solrjs` dependency**. Taking master's side there
+looks right (its dependency work is newer) but reintroduces the package while the code
+imports `lib/solrjs`; both resolve, so it fails silently. Full risk analysis:
+`Docs/ALPHA_TO_MASTER_MERGE_RISK.md`.
 
-When branching from alpha, **diff against `upstream/alpha`, not a git merge-base** — merge-bases
-in this repo are reliably stale and over-count the delta by re-showing already-shipped fixes.
+Historical reports (`Docs/ALPHA_MERGE_REPORT.md`, `Docs/ALPHA_PR_BODY.md`,
+`Docs/ALPHA_MERGE_REPORT_SLACK.txt`, `Docs/BRANCH_RISK_ANALYSIS.md`) describe the pre-#189
+delta and are provenance only.
+
+**Rolling the deployment between these two points requires `npm ci`, not just a checkout.**
+The manifests differ: pre-merge master needs the external `solrjs` package, post-merge
+master needs `dojo-declare` for the inlined client. A bare `git checkout` in either
+direction gives every worker `Cannot find module …`. Verify before restarting:
+
+```bash
+node -e "require('dojo-declare/declare'); require('./lib/solrjs'); console.log('deps OK')"
+```
+
+**Offline-suite baseline on master is 327 passing / 1 failing** — the known
+`fastaHeaderFormatter` case. (On `feature/eliminate-self-call` it is 350/1; that branch adds
+23 tests.)
+
+**`distributedQuery` defaults to `enabled: true` with an empty `excludeNodes`,** and the path
+needs direct network access to every Solr replica, which the production deployment does not
+have. Production `p3api.conf` sets `enabled: false` — that is deliberate, keep it. The
+`excludeNodes` list lives only in that untracked file.
 
 ## Planning docs (not yet implemented)
 
@@ -34,10 +55,48 @@ Repo-root `PLAN_*.md` files are proposals, in varying states of vetting:
 
 | doc | subject |
 |---|---|
+| `PLAN_ELIMINATE_SELF_CALL.md` | **IN PROGRESS** — removing HTTP self-calls. Steps 1–2 shipped on `feature/eliminate-self-call`; see below. |
 | `PLAN_PRIVATE_METADATA_OVERLAY.md` | Private per-user metadata collection overlaying `genome` — display, filter, facet. See below. |
 | `PLAN_GENOME_POSTFILTER.md` | JS-side post-filtering for negation-only `genome()` conditions |
 | `PLAN_DOWNLOAD_SSE_NOTIFICATIONS.md` | SSE start/complete events for downloads (hidden-form POSTs can't read headers) |
 | `PLAN_SOLR_OVERLOAD_PROTECTION.md` | Multi-layer throttling; broad-taxon join OOM mitigation |
+
+### HTTP self-calls (in progress — `feature/eliminate-self-call`)
+
+**The API calls its own listening port instead of invoking handlers in-process**, at 17
+sites. Over a 36-hour production window `::ffff:127.0.0.1` was the top client by a factor of
+three: **33,101 requests (33% of all traffic), 615,681s cumulative**. Beyond the wasted round
+trip it is a resource-loop hazard — an outer request holds a slot in the same worker pool its
+children need, so parents can occupy every slot while children queue behind them.
+
+Find them with `grep -rn "get('http_port')" --include=*.js` (excluding `app.js`'s own
+`listen`). They are **identical on master and alpha** — no branch has ever fixed any of them.
+
+Shipped so far on the branch (based on `6397c6cf`, pushed to `upstream`):
+
+- **`febb9cf8`** — `multiQuery` no longer stores sub-query failures as results.
+  `util/http.js`'s `httpRequest` discards `res.statusCode` and resolves the body regardless,
+  so a 500's error body was `JSON.parse`d into the caller's result slot inside an outer HTTP
+  200. New `httpRequestWithStatus()` exposes the status; `httpRequest` is unchanged because
+  four other call sites expect a bare string.
+- **`fcee5a0a`** — `lib/internalQuery.js`, inert until the conversions land. Goes **direct to
+  Solr** rather than synthesizing a `req`/`res` and replaying the ~27-middleware chain,
+  following the `media/genbank.js` precedent (`06dd7618`).
+
+Two invariants for anything built on `internalQuery`:
+
+- **`user` is explicit at every call site; `publicFree` defaults.** Neither default is safe
+  for `user` — `multiQuery` forwards the caller's identity, while `/data` must stay anonymous
+  because its `apicache` key is **not user-scoped**, so inheriting an identity would leak
+  private counts into a shared cache. `publicFree` defaults because `buildPermissionFq`
+  fails **closed** without it and would silently over-filter exempt collections.
+- **The collection allowlist must be reinstated.** The HTTP path gates it at `app.js:187`
+  via `app.param('dataType')`; callers build the target from client-supplied input, so
+  bypassing HTTP would otherwise allow a query against an arbitrary Solr core.
+
+Remaining: `/data` characterization tests (**needs a live API + Solr** — that route has zero
+coverage and step 5 rewrites it), then the three conversions, then a wall-clock deadline in
+`util/http.js`. Status table and pickup instructions are at the top of the plan.
 
 ### Facet counts cannot be corrected inside Solr
 
@@ -508,6 +567,37 @@ Offline suites (`test-util`, `test-join`, `test-distributed`) run without Solr o
 **247 passing / 2 failing**. `test-security` and `test-api` need a live API and will
 `ECONNREFUSED` without one. `npx eslint` reports 56 pre-existing errors on the files touched
 here; that count is unchanged by the refresh.
+
+## Outbound request timeouts — two known gaps
+
+The recurring failure mode in this codebase is an **outbound HTTP call with no deadline**. A
+connection that is accepted but never answered (classically a pooled keepAlive socket the far
+side has already dropped — a silent drop leaves no FIN, so the socket cannot be probed before
+use) hangs until the OS tears down the TCP session. Measured at ~166s in
+`Docs/GENBANK_DOWNLOAD_PERFORMANCE.md`; Cloudflare's ~100s origin limit fires first, so the
+user sees a **524** while the worker still holds a socket slot.
+
+PR #203 added `SOLR_REQUEST_TIMEOUT_MS` (default 120000) to the main data path.
+`middleware/APIMethodHandler.js` builds all its Solr clients through `makeSolrClient()` so no
+path can miss it, and `armTimeout()` in `lib/solrjs/index.js` now covers `query`, `get`,
+`getSchema`, and the streaming path (previously only `query` honored `this.timeout`).
+
+**Two gaps remain, both verified by experiment 2026-08-25:**
+
+1. **A socket timeout does not bound time spent queued for a socket.** `req.setTimeout` only
+   starts once the agent assigns a socket. Tested with `maxSockets: 1` against a black-hole
+   server: a request with a 2000 ms timeout was **still pending after 6000 ms**. With
+   `maxSockets: 8`, anything that slows Solr fills the pool and request 9 waits with no timer
+   running — worst case is *(unbounded queue wait) + 120s*.
+2. **`util/http.js` has no timeout mechanism at all** — not merely unset, absent. It carries
+   the Workspace API calls and all 17 self-call sites.
+
+A wall-clock deadline started at request creation fixes both; it is step 7 of
+`PLAN_ELIMINATE_SELF_CALL.md`.
+
+Also note `maxFreeSockets: 0` does **not** disable pooling — Node treats `0` as unset and
+falls back to its default, so idle sockets are still retained. (Tested; an earlier note in
+this file claiming otherwise was wrong.)
 
 ## Security Notes
 

@@ -1,5 +1,69 @@
 # feature/eliminate-self-call — remove HTTP self-calls from the hot path
 
+## STATUS (2026-08-25) — steps 1–2 done, step 3 blocked on a live environment
+
+Branch `feature/eliminate-self-call`, pushed to `upstream`, based on `6397c6cf` (master).
+
+| step | state | commit |
+|---|---|---|
+| 1. `multiQuery` error propagation | **done** | `febb9cf8` |
+| 2. `lib/internalQuery.js` + tests | **done** (inert — no call sites converted) | `fcee5a0a` |
+| 3. `/data` characterization tests | **NEXT — needs live API + Solr** | — |
+| 4. Convert `multiQuery` | not started | — |
+| 5. Convert `dataRouter` | not started | — |
+| 6. Convert `ExpandingQuery` | not started | — |
+| 7. `util/http.js` wall-clock deadline | not started | — |
+| 8. `CLAUDE.md` pass | not started | — |
+
+Also on the branch: `ee4c56b8`, the hang-investigation handoff
+(`Docs/HANG-INVESTIGATION-2026-08-24.md`) — unrelated incident, carried here so it is not
+stranded on a merged branch.
+
+**Test baseline on this branch: 350 passing / 1 failing.** The failure is the known
+pre-existing `fastaHeaderFormatter` case. Baseline was 327 before this work (+4 multiQuery
+error tests, +19 internalQuery tests). Run with:
+
+```bash
+npx mocha -R dot tests/test-util/test.*.spec.js tests/test-join/test.*.spec.js \
+  tests/test-distributed/test.*.spec.js tests/test-api/test.multiquery-errors.spec.js \
+  tests/test-permissions/test.internalquery.spec.js
+```
+
+### Why step 3 needs a different machine
+
+`/data/*` has **zero test coverage** today, and step 5 rewrites it. The characterization
+tests must capture the *current* HTTP behavior — real facet counts, real `json.facet`
+output — so the conversion can be held to byte-identical results. That requires a live API
+and a populated Solr; a mock would encode assumptions rather than reality, which is
+exactly the failure mode `Docs/`-recorded experience warns about ("this codebase's bugs are
+HTTP 200 with wrong data; mocks miss them, assert on exact counts").
+
+Endpoints needing capture (all in `routes/dataRouter.js`):
+
+- `/data/summary_by_taxon/:taxon_id` — 4 concurrent self-calls; `json.facet` unique counts
+  on `genome`, a cross-collection join facet on `genome_feature`, plus `strain` and
+  `subsystem`
+- `/data/distinct/:collection/:field` — 1 self-call, allowlisted collection/field pairs
+- `/data/subsystem_summary/:genome_id` — 1 self-call
+- `/data/taxon_category/` — already partly in-process; **no permission filter at all**
+  (see "Documented-but-not-fixed")
+
+Capture a few known-good taxon ids (e.g. `2` bacteria, `10239` viruses, `1386`) and store
+the responses as fixtures. Note `apicache` caches these for 1 day under a **non-user-scoped**
+key, so flush Redis or use fresh ids between runs or you will characterize the cache.
+
+### Picking the work up elsewhere
+
+```bash
+git fetch upstream
+git checkout -b feature/eliminate-self-call upstream/feature/eliminate-self-call
+npm ci      # REQUIRED — master needs dojo-declare for the inlined lib/solrjs
+node -e "require('dojo-declare/declare'); require('./lib/solrjs'); console.log('deps OK')"
+```
+
+Read `Docs/HANG-INVESTIGATION-2026-08-24.md` first if the production hangs are still open —
+it lists what has already been ruled out, including two theories that tested false.
+
 ## Context
 
 The API makes HTTP requests back to its **own listening port** instead of invoking
@@ -367,12 +431,24 @@ individually. `lib/internalQuery.js` is additive and inert until a caller uses i
 
 ## Sequencing
 
-1. **`multiQuery` error propagation, on its own commit.** Reordered to the front: it is the
-   only change here that fixes *wrong data* rather than slow data, and 3,274 500s in the
-   36-hour window are currently being rendered as successful partial results. It is also
-   small and independently shippable — it does not depend on `internalQuery` existing.
-2. `lib/internalQuery.js` + its unit and permission tests (no call sites converted; inert).
-3. `/data` characterization tests against current behavior.
+1. ~~**`multiQuery` error propagation, on its own commit.**~~ **DONE (`febb9cf8`).**
+   Reordered to the front: it is the only change here that fixes *wrong data* rather than
+   slow data, and 3,274 500s in the 36-hour window were being rendered as successful
+   partial results. Added `httpRequestWithStatus()` to `util/http.js` rather than changing
+   `httpRequest`'s resolve shape (four other call sites expect a bare string). Kept
+   per-sub-query error reporting instead of letting `Promise.all` reject — otherwise one
+   failing panel would take down every other panel, a worse regression than the bug.
+   Verified as a real gate: 3 of 4 new tests fail against the pre-fix code.
+2. ~~`lib/internalQuery.js` + its unit and permission tests.~~ **DONE (`fcee5a0a`).** Inert;
+   no call sites converted. Reuses `buildPermissionFq` so it cannot drift from
+   `DecorateQuery` (verified identical `fq` across anonymous/authenticated/publicFree).
+   Reinstates the `app.param('dataType')` collection allowlist, which bypassing HTTP would
+   otherwise skip. Detects Solr errors returned in the body with HTTP 200.
+   `middleware/PublicDataTypes.js` now also exports its list so the `publicFree` default
+   cannot drift; the middleware export is unchanged. Mutation-checked: deleting the
+   permission `fq` fails 3 tests.
+3. `/data` characterization tests against current behavior. **← NEXT. Needs a live API +
+   Solr; see STATUS at the top for what to capture and why a mock will not do.**
 4. Stage 1 (`multiQuery`) conversion — biggest measured win, has a real test gate.
 5. Stage 2 (`dataRouter`) — now protected by step 3.
 6. Stage 3 (`ExpandingQuery`) — highest deadlock value, trickiest recursion.
