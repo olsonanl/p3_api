@@ -3,6 +3,39 @@ const https = require('https')
 const { withUserAgent } = require('../lib/userAgent')
 
 module.exports = {
+  // Like httpRequest, but resolves { statusCode, body } instead of just the body.
+  //
+  // Every other helper here throws away res.statusCode, so a caller cannot tell a
+  // 500 from a 200 — it just gets the response body as a string. Callers that
+  // JSON.parse the result then store an error object where rows should be, and the
+  // failure is invisible: the outer request returns HTTP 200 with a body that looks
+  // structurally plausible. See routes/multiQuery.js for the case this was added for.
+  //
+  // Added rather than changing httpRequest's resolve shape, because that helper has
+  // four other call sites that expect a bare string.
+  'httpRequestWithStatus': async (options, body) => {
+    options = { ...options, headers: withUserAgent(options && options.headers) }
+    return new Promise((resolve, reject) => {
+      const req = http.request(options, (res) => {
+        res.setEncoding('utf8')
+        let rawData = ''
+        res.on('data', (chunk) => {
+          rawData += chunk.toString()
+        })
+        res.on('end', () => {
+          resolve({ statusCode: res.statusCode, body: rawData })
+        })
+        res.on('error', (err) => {
+          reject(new Error(`Unable to receive a response. ${err.code || err}`))
+        })
+      })
+      req.on('error', (err) => {
+        reject(new Error(`Unable to request the database. ${err.code || err}`))
+      })
+      req.write(body)
+      req.end()
+    })
+  },
   'httpGet': async (options) => {
     options = { ...options, headers: withUserAgent(options && options.headers) }
     return new Promise((resolve, reject) => {
