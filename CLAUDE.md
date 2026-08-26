@@ -87,7 +87,7 @@ Shipped so far on the branch (based on `6397c6cf`, pushed to `upstream`):
 - **`73e5d2a3`** — `multiQuery` converted.
 - **`31a1d5ad`** — `dataRouter` converted (3 sites; `/taxon_category/` was already
   in-process). Also fixes a **production-crash defect** — see below.
-- **`5a36bf72`** — `ExpandingQuery` converted (`runJoinQuery`, `runSDISubQuery`). Fixes the
+- **`6b1335e4`** — `ExpandingQuery` converted (`runJoinQuery`, `runSDISubQuery`). Fixes the
   **same abort from a second route** and a live cross-collection-download break; see below.
 
 Two invariants for anything built on `internalQuery`:

@@ -13,7 +13,7 @@ upstream" and that is wrong. The two remotes are `origin`
 |---|---|
 | `origin/feature/eliminate-self-call` | `797adf86` |
 | `bob/feature/eliminate-self-call` | `ee4c56b8` (4 behind origin) |
-| local `HEAD` | `31a1d5ad` (5 ahead of origin) |
+| local `HEAD` | the step-6 doc commit, **8 ahead of origin** — `git log --oneline 797adf86..HEAD` |
 
 | step | state | commit |
 |---|---|---|
@@ -22,12 +22,13 @@ upstream" and that is wrong. The two remotes are `origin`
 | 3. `/data` characterization tests | **done** | `c868a061` |
 | 4. Convert `multiQuery` | **done** — first live caller | `73e5d2a3` |
 | 5. Convert `dataRouter` | **done** — also fixes a production abort | `31a1d5ad` |
-| 6. Convert `ExpandingQuery` | **done** — also fixes a second production abort | `5a36bf72` |
+| 6. Convert `ExpandingQuery` | **done** — also fixes a second production abort | `6b1335e4` |
 | 7. `util/http.js` wall-clock deadline | **NEXT** — not started | — |
 | 8. `CLAUDE.md` pass | partially done in `31a1d5ad`'s follow-up commit | — |
 
-**Six commits are local only** — `c868a061`, `73e5d2a3`, `c42d88a0`, `31a1d5ad`, `43212317`
-(docs), and `5a36bf72` (step 6). Nothing has been pushed to either remote since `797adf86`.
+**Everything after `797adf86` is local only** — `c868a061`, `73e5d2a3`, `c42d88a0`,
+`31a1d5ad`, `43212317` (docs), `6b1335e4` (step 6), and its doc commit. Nothing has been
+pushed to either remote.
 
 **All three hot-path self-callers are now converted** (`multiQuery`, `dataRouter`,
 `ExpandingQuery`) — that is the whole of this branch's stated code scope. Non-test sites
