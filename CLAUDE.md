@@ -108,7 +108,10 @@ object, so whichever module loads first captures a stale `{}` for its partner an
 surfaces only when a query needs it. That is why `sanitizeErrorMessage` lives in
 `lib/sanitizeErrorMessage.js` and is merely *re-exported* from `RQLQueryParser`.
 
-Remaining: a wall-clock deadline in `util/http.js` (step 7). Status table and pickup
+- **`3fc64ead`** — wall-clock deadline in `util/http.js` (step 7). See "Outbound request
+  timeouts" below; that section's two gaps are now closed.
+
+All code steps are done; only the documentation pass remains. Status table and pickup
 instructions are at the top of the plan.
 
 The 9 RPC self-call sites are deliberately deferred (the RPC identity model is
@@ -686,7 +689,7 @@ Offline suites (`test-util`, `test-join`, `test-distributed`) run without Solr o
 `ECONNREFUSED` without one. `npx eslint` reports 56 pre-existing errors on the files touched
 here; that count is unchanged by the refresh.
 
-## Outbound request timeouts — two known gaps
+## Outbound request timeouts — both gaps now closed
 
 The recurring failure mode in this codebase is an **outbound HTTP call with no deadline**. A
 connection that is accepted but never answered (classically a pooled keepAlive socket the far
@@ -700,18 +703,43 @@ PR #203 added `SOLR_REQUEST_TIMEOUT_MS` (default 120000) to the main data path.
 path can miss it, and `armTimeout()` in `lib/solrjs/index.js` now covers `query`, `get`,
 `getSchema`, and the streaming path (previously only `query` honored `this.timeout`).
 
-**Two gaps remain, both verified by experiment 2026-08-25:**
+**Two gaps were found, both verified by experiment 2026-08-25:**
 
 1. **A socket timeout does not bound time spent queued for a socket.** `req.setTimeout` only
    starts once the agent assigns a socket. Tested with `maxSockets: 1` against a black-hole
    server: a request with a 2000 ms timeout was **still pending after 6000 ms**. With
    `maxSockets: 8`, anything that slows Solr fills the pool and request 9 waits with no timer
    running — worst case is *(unbounded queue wait) + 120s*.
-2. **`util/http.js` has no timeout mechanism at all** — not merely unset, absent. It carries
+2. **`util/http.js` had no timeout mechanism at all** — not merely unset, absent. It carries
    the Workspace API calls and all 17 self-call sites.
 
-A wall-clock deadline started at request creation fixes both; it is step 7 of
-`PLAN_ELIMINATE_SELF_CALL.md`.
+**Both are fixed in `util/http.js` by `3fc64ead`** (step 7 of `PLAN_ELIMINATE_SELF_CALL.md`)
+with a wall-clock deadline armed at request *creation* — a plain `setTimeout`, deliberately
+**not** `req.setTimeout`, which is what makes gap 1 go away: one number covers queue wait,
+connect, TLS, write, and response body.
+
+- `HTTP_REQUEST_TIMEOUT_MS`, default 120000, matching `SOLR_REQUEST_TIMEOUT_MS`.
+- Per-call override via `options.timeout`; **`timeout: 0` disables** the deadline entirely,
+  for a caller that genuinely wants to wait.
+- Rejects with `err.code === 'ETIMEDOUT'` and destroys the request so the socket is released.
+  The message names host and path with the **query string stripped** — these reach clients,
+  and a self-call path carries the caller's filter.
+- All 10 async helpers are covered; the non-async `requestUrlForUrl` is not.
+
+Two things to preserve when touching this file. The timer must be cleared on **both** settle
+paths — mocha runs without `--exit`, so a leaked 120s timer stalls an entire suite rather
+than failing one test. And `tests/test-util/test.userAgent.spec.js:126` counts
+`'http[a-zA-Z]*':\s*async` against `withUserAgent(options` and requires the two to be equal,
+so a new helper needs both the UA merge and the deadline.
+
+Gate: `tests/test-util/test.httpTimeout.spec.js` (9 tests, fully offline — two local servers,
+no API/Solr/Redis). 8 of the 9 fail against the pre-change module. The one that matters most
+is "the deadline bounds time spent QUEUED for a socket": swap `armDeadline`'s `setTimeout` for
+`req.setTimeout` and that test hangs while the other eight still pass.
+
+**Gap 1 still applies to the Solr path.** `armTimeout()` in `lib/solrjs/index.js` remains
+`req.setTimeout`-based, so `SOLR_REQUEST_TIMEOUT_MS` does not bound queue wait. Only
+`util/http.js` has the creation-time deadline.
 
 Also note `maxFreeSockets: 0` does **not** disable pooling — Node treats `0` as unset and
 falls back to its default, so idle sockets are still retained. (Tested; an earlier note in

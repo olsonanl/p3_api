@@ -1,6 +1,6 @@
 # feature/eliminate-self-call — remove HTTP self-calls from the hot path
 
-## STATUS (2026-08-26) — steps 1–6 done, step 7 next
+## STATUS (2026-08-26) — steps 1–7 done; only the step-8 doc pass remains
 
 Branch `feature/eliminate-self-call`, based on `6397c6cf` (master).
 
@@ -23,12 +23,15 @@ upstream" and that is wrong. The two remotes are `origin`
 | 4. Convert `multiQuery` | **done** — first live caller | `73e5d2a3` |
 | 5. Convert `dataRouter` | **done** — also fixes a production abort | `31a1d5ad` |
 | 6. Convert `ExpandingQuery` | **done** — also fixes a second production abort | `6b1335e4` |
-| 7. `util/http.js` wall-clock deadline | **NEXT** — not started | — |
-| 8. `CLAUDE.md` pass | partially done in `31a1d5ad`'s follow-up commit | — |
+| 7. `util/http.js` wall-clock deadline | **done** — closes both outbound-timeout gaps | `3fc64ead` |
+| 8. `CLAUDE.md` pass | partially done in `43212317`, `649f1bab`, and step 7's follow-up | — |
+
+**All code steps are complete.** What remains is documentation and the maintainer decision
+in "Open question" below.
 
 **Everything after `797adf86` is local only** — `c868a061`, `73e5d2a3`, `c42d88a0`,
-`31a1d5ad`, `43212317` (docs), `6b1335e4` (step 6), and its doc commit. Nothing has been
-pushed to either remote.
+`31a1d5ad`, `43212317` (docs), `6b1335e4` (step 6), `649f1bab` (docs), `3fc64ead` (step 7),
+and its doc commit. Nothing has been pushed to either remote.
 
 **All three hot-path self-callers are now converted** (`multiQuery`, `dataRouter`,
 `ExpandingQuery`) — that is the whole of this branch's stated code scope. Non-test sites
@@ -161,6 +164,85 @@ entries.
   parse is the same either way) — it is `PLAN_SOLR_OVERLOAD_PROTECTION.md` territory. It is
   also why the probe set uses an explicit three-genome `in()` rather than a status filter.
 
+### Verification results for step 7 (all green as of 2026-08-26)
+
+`3fc64ead`. Every figure taken **twice** — `util/http.js` reverted to `git show HEAD:` plus a
+server restart, then the new code plus a server restart — against the same live Solr, with
+`API_URL=http://localhost:23001`.
+
+| suite | pre-change | post-change |
+|---|---|---|
+| offline (`test-util`, `test-join`, `test-distributed`) | 327 / 1 | **336 / 1** (+9 new; known `fastaHeaderFormatter`) |
+| branch offline command (below) | 366 / 1 | **375 / 1** |
+| `tests/test-api/` | 64 / 3 | 64 / 3 (same three known failures as step 6) |
+| `tests/test-security/` | 50 / 1 | 50 / 1 |
+| `tests/test-permissions/` | 92 / 9 | 92 / 9 |
+| `tests/test-media/` | 11 / 10 | 11 / 10 — **identical test titles**; all 10 are pre-existing fixture drift |
+| `tests/test-rpc/` | 1 / 6 in 4m, **mocha never exited** (still alive at 30 min) | 1 / 6 in **2m, exits cleanly** |
+| `tests/test-download/test.cross-collection.spec.js` | 2 pass / 9 pending | 2 pass / 9 pending |
+| `npx eslint util/http.js` | 13 errors | 11 errors — the removed 2 were incidental; the rest pre-existing |
+
+`test-rpc` is the clearest live demonstration of what this step fixes. Pre-change a pending
+`httpRequest` with no deadline held its socket open, and mocha runs without `--exit`, so the
+whole suite stalled indefinitely on an open handle. Post-change the same requests give up at
+the deadline and the runner terminates.
+
+**Honest caveat: `test-rpc` takes the dev worker down on _both_ codepaths.** The trigger is
+`rpc/transcriptomicsGene.js:146` — `TypeError: Cannot read properties of undefined (reading
+'numFound')`, i.e. the exact `JSON.parse`-on-a-self-call-body shape at a **deliberately
+deferred** site. The identical unhandled rejection is in the pre-change log at the same line.
+The difference is only in *when* the corruption surfaces: post-change the client stops waiting
+after 120s and issues the next Solr-backed request, which trips the `async_hooks` assertion;
+pre-change the client hung forever, so nothing followed it and the abort never fired. The
+corruption is pre-existing and unrelated to this step — but note that giving callers a
+deadline makes latent damage at the deferred sites **visible sooner**, which is an argument
+for auditing them rather than against the deadline.
+
+One measurement artifact worth recording: a `test-download` run immediately after `test-rpc`
+reported 0 passing / 11 pending with `[skip] API not reachable`. That was the aborted worker,
+not a regression — after a restart it matched baseline exactly.
+
+#### The gate
+
+With `git show HEAD:util/http.js` in place, **8 of the 9 new tests fail** — the black-hole
+cases by mocha timeout (20000 ms exceeded) rather than by assertion, `DEFAULT_TIMEOUT_MS` as
+`expected undefined to equal 120000`, and the timer test as *"the deadline was never armed, so
+this test proves nothing"*. The 9th ("an explicit `timeout` of 0 disables the deadline")
+correctly passes, because that **is** the pre-change behavior everywhere.
+
+#### Why not `req.setTimeout`
+
+`armTimeout()` in `lib/solrjs/index.js:46` is the model for the shape but not for the
+mechanism. `req.setTimeout` is a **socket** timeout: its timer does not start until the agent
+assigns a socket, so time queued behind `maxSockets` is unbounded. Re-verified for this step —
+with `maxSockets: 1` against a black-hole server, a request with a 2000 ms `req.setTimeout`
+was still pending at 6000 ms. A deadline armed at request creation covers queue wait, connect,
+TLS, write, and body in one number.
+
+`tests/test-util/test.httpTimeout.spec.js`'s "the deadline bounds time spent QUEUED for a
+socket" pins exactly this. **Swap `armDeadline`'s `setTimeout` for `req.setTimeout` and that
+one test hangs while the other eight still pass** — which is the property that makes it worth
+having.
+
+#### Surface
+
+`HTTP_REQUEST_TIMEOUT_MS`, default 120000, matching `SOLR_REQUEST_TIMEOUT_MS`. Per-call
+override via `options.timeout`; `timeout: 0` disables. Rejection is `code: 'ETIMEDOUT'` with a
+message naming host and path — **query string stripped**, since these reach clients and a
+self-call path carries the caller's filter. All 10 async helpers are covered; the non-async
+`requestUrlForUrl` is untouched.
+
+Two constraints the implementation had to respect:
+
+- **Clear the timer on both settle paths.** An uncancelled 120s timer keeps the event loop
+  alive; under mocha (no `--exit`) that stalls the entire suite rather than failing one test.
+  The regression test stubs `global.setTimeout`/`clearTimeout` and watches for one
+  distinctive delay, because counting active `Timeout` resources is too noisy to assert on —
+  an accepted connection arms server-side keepAlive/headers timers of its own.
+- **Keep `tests/test-util/test.userAgent.spec.js:126` satisfied.** It counts
+  `'http[a-zA-Z]*':\s*async` (10) against `withUserAgent(options` (10) and requires them
+  equal, so every helper that gained a deadline had to keep its UA merge.
+
 ### Run the test suites against the DEV server, not :3001
 
 `tests/test-api/test.data-router.spec.js` defaults to `API_URL=http://localhost:3001`, which
@@ -182,9 +264,10 @@ Also on the branch: `ee4c56b8`, the hang-investigation handoff
 (`Docs/HANG-INVESTIGATION-2026-08-24.md`) — unrelated incident, carried here so it is not
 stranded on a merged branch.
 
-**Offline test baseline on this branch: 366 passing / 1 failing.** The failure is the known
+**Offline test baseline on this branch: 375 passing / 1 failing.** The failure is the known
 pre-existing `fastaHeaderFormatter` case. Baseline was 327 before this work (+10 multiQuery
-error tests, +19 internalQuery tests, +10 internalQuery SSRF tests). Run with:
+error tests, +19 internalQuery tests, +10 internalQuery SSRF tests, +9 http-deadline tests).
+Run with:
 
 ```bash
 npx mocha -R dot tests/test-util/test.*.spec.js tests/test-join/test.*.spec.js \
@@ -310,8 +393,10 @@ network topology, not just transport. **Read the production config before assumi
 **Added to scope after the 36-hour analysis:** a wall-clock deadline in `util/http.js`.
 It is the same defect class, it lands in the file this branch is already rewriting, and
 without it the converted call sites would still have no bound. Covers both gaps in item 4
-above — queue-wait and the missing mechanism — via one helper, mirroring `armTimeout()` in
-`lib/solrjs/index.js` and using the same env-var pattern as `SOLR_REQUEST_TIMEOUT_MS`.
+above — queue-wait and the missing mechanism — via one helper, using the same env-var
+pattern as `SOLR_REQUEST_TIMEOUT_MS`. **Done in `3fc64ead`**; note the one departure from
+the sketch above — it does *not* mirror `armTimeout()`'s mechanism, because `req.setTimeout`
+cannot cover queue wait. See "Verification results for step 7".
 
 ---
 
@@ -638,6 +723,8 @@ step below is read.
 | `routes/multiQuery.js` | replace `subQuery`; forward identity; validate collection; propagate sub-query errors |
 | `routes/dataRouter.js` | replace `subQuery`; pin anonymous; add limitation comment |
 | `ExpandingQuery.js` | convert `runJoinQuery` + `runSDISubQuery`; fix `opts.req.headers` guard |
+| `util/http.js` | `httpRequestWithStatus()`; wall-clock deadline on all 10 async helpers |
+| `tests/test-util/test.httpTimeout.spec.js` | **new** — the deadline gate, fully offline |
 | `CLAUDE.md` | document the `/data` public-only limitation and the deferred findings |
 | `tests/test-api/test.internal-query.spec.js` | **new** — unit tests for the helper |
 | `tests/test-api/test.data-router.spec.js` | **new** — `/data/*` currently has zero coverage |
@@ -662,7 +749,8 @@ on "we got bytes" (`CLAUDE.md`, and the cross-collection-download record).
 - `tests/test-download/test.cross-collection.spec.js` — exercises `CrossCollectionSource`,
   the caller that passes `{req:{}}` into `ExpandingQuery`.
 - Offline baseline: `test-util`, `test-join`, `test-distributed` → **327 passing / 1
-  failing** (the known `fastaHeaderFormatter` case). Any other failure is a regression.
+  failing** at the start of this work, **336 / 1** with step 7's tests added (the 1 is the
+  known `fastaHeaderFormatter` case). Any other failure is a regression.
 
 **New tests:**
 
@@ -726,14 +814,17 @@ individually. `lib/internalQuery.js` is additive and inert until a caller uses i
    `middleware/PublicDataTypes.js` now also exports its list so the `publicFree` default
    cannot drift; the middleware export is unchanged. Mutation-checked: deleting the
    permission `fq` fails 3 tests.
-3. `/data` characterization tests against current behavior. **← NEXT. Needs a live API +
-   Solr; see STATUS at the top for what to capture and why a mock will not do.**
-4. Stage 1 (`multiQuery`) conversion — biggest measured win, has a real test gate.
-5. Stage 2 (`dataRouter`) — now protected by step 3.
-6. Stage 3 (`ExpandingQuery`) — highest deadlock value, trickiest recursion.
-7. Wall-clock deadline in `util/http.js` (see Scope). Can land any time after step 1;
-   independent of the conversions.
-8. `CLAUDE.md` documentation pass.
+3. ~~`/data` characterization tests against current behavior.~~ **DONE (`c868a061`).**
+   Needed a live API + Solr; a mock would have characterized the mock.
+4. ~~Stage 1 (`multiQuery`) conversion — biggest measured win.~~ **DONE (`73e5d2a3`).**
+5. ~~Stage 2 (`dataRouter`) — protected by step 3.~~ **DONE (`31a1d5ad`).** Also fixed a
+   reachable production worker abort.
+6. ~~Stage 3 (`ExpandingQuery`) — highest deadlock value, trickiest recursion.~~
+   **DONE (`6b1335e4`).** Also fixed the same abort reached from a second route, and a live
+   cross-collection-download break.
+7. ~~Wall-clock deadline in `util/http.js` (see Scope).~~ **DONE (`3fc64ead`).** Landed last,
+   though it was independent of the conversions and could have gone any time after step 1.
+8. `CLAUDE.md` documentation pass. **← the only step left.**
 
 **Deploy note:** let master soak in production before stacking this on top. #202 was
 deployed once and rolled back, so the current master has not had a clean production run.
