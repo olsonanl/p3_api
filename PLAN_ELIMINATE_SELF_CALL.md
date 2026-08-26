@@ -1,6 +1,6 @@
 # feature/eliminate-self-call — remove HTTP self-calls from the hot path
 
-## STATUS (2026-08-26) — steps 1–5 done, step 6 next
+## STATUS (2026-08-26) — steps 1–6 done, step 7 next
 
 Branch `feature/eliminate-self-call`, based on `6397c6cf` (master).
 
@@ -22,12 +22,27 @@ upstream" and that is wrong. The two remotes are `origin`
 | 3. `/data` characterization tests | **done** | `c868a061` |
 | 4. Convert `multiQuery` | **done** — first live caller | `73e5d2a3` |
 | 5. Convert `dataRouter` | **done** — also fixes a production abort | `31a1d5ad` |
-| 6. Convert `ExpandingQuery` | **NEXT** — not started | — |
-| 7. `util/http.js` wall-clock deadline | not started | — |
+| 6. Convert `ExpandingQuery` | **done** — also fixes a second production abort | `5a36bf72` |
+| 7. `util/http.js` wall-clock deadline | **NEXT** — not started | — |
 | 8. `CLAUDE.md` pass | partially done in `31a1d5ad`'s follow-up commit | — |
 
-**Five commits are local only** — `c868a061`, `73e5d2a3`, `c42d88a0`, `31a1d5ad`, and the
-doc commit after it. Nothing has been pushed to either remote since `797adf86`.
+**Six commits are local only** — `c868a061`, `73e5d2a3`, `c42d88a0`, `31a1d5ad`, `43212317`
+(docs), and `5a36bf72` (step 6). Nothing has been pushed to either remote since `797adf86`.
+
+**All three hot-path self-callers are now converted** (`multiQuery`, `dataRouter`,
+`ExpandingQuery`) — that is the whole of this branch's stated code scope. Non-test sites
+still matching `grep -rn "get('http_port')" --include=*.js`:
+
+| site | why it is still there |
+|---|---|
+| `app.js:43` | the real `listen`, not a self-call |
+| `rpc/{msa,biosetResult,proteinFamily,panaconda,transcriptomicsGene}.js` (9) | deliberately deferred — see "RPC identity model" below |
+| `bundler/genome.js:10` | not reached from the data path; never appeared in the traffic analysis |
+| `util/featureSequence.js:12,29` | `:29` is dead code (not exported); `:12` is a live one-shot lookup, unassessed |
+
+`bundler/genome.js` and `util/featureSequence.js:12` were not in the original 17-site tally
+and are not part of steps 1–8. They carry the same `JSON.parse`-on-a-self-call-body shape
+and should get the same audit eventually.
 
 **Open question for the maintainer:** the `dataRouter` crash fix is entangled with the
 refactor in `31a1d5ad`. Production runs the unfixed code and this defect is reachable by any
@@ -64,6 +79,86 @@ vs prod `:3001` old code, same Solr) matched on `private_genomes`, `public_ctl` 
 `private_features` — 5 private rows authenticated, 0 anonymous, both directions.
 `own_genomes` differs only because production still carries the silent-200 bug fixed in
 `febb9cf8`.
+
+### Verification results for step 6 (all green as of 2026-08-26)
+
+Every suite run against `API_URL=http://localhost:23001`, and every number below taken
+**both** with the conversion and with it stashed, on the same live Solr:
+
+| suite | pre-conversion | converted |
+|---|---|---|
+| offline (`test-util`, `test-join`, `test-distributed`) | 327 / 1 | **327 / 1** (known `fastaHeaderFormatter`) |
+| `tests/test-api/` (whole dir) | 52 / 3 | **64 / 3** — same three failures, +12 from the new spec |
+| `tests/test-security/` | 50 / 1 | **50 / 1** |
+| `tests/test-permissions/` | 92 / 9 | **92 / 9** (all 9 are the genome-permission *write* suites; fixture-dependent) |
+| `tests/test-download/test.cross-collection.spec.js` | 2 pass / 9 pending | 2 pass / 9 pending |
+| `tests/test-api/test.expanding-errors.spec.js` (new) | **worker aborted on case 1** | **12 / 12** |
+| `npx eslint` on the 5 changed files | 1 error | 1 error, pre-existing (`ExpandingQuery.js` `'DME' is not defined`) |
+
+The three pre-existing `test-api` failures are `Get Schema`, `Test Error handler`, and
+`test.expanding.spec.js`'s `with workspaceObject`. The last is a **fixture** problem, not a
+code one: it asserts on `/harry@patricbrc.org/home/Genome Groups/Escherichia representative
+genomes`, which `tests/config.json`'s token cannot read, so it gets 0 where it wants 4. It
+fails identically with the conversion stashed.
+
+**One trap worth recording.** `test.expanding.spec.js`'s `join query` runs on mocha's default
+**2000 ms** timeout and the underlying request is 1.8–5.2 s cold, sub-100 ms warm (apicache
+plus Solr's filter cache). It therefore passes or fails on whether something warmed the route
+first — during this work it failed three runs in a row purely because a stash/restart cycle
+had left a cold server, and passed 3/3 immediately after on the same code. It is a flaky
+test, not a signal. Pre-conversion timings for the same request were **slower**
+(5.2/2.8/1.8/2.2 s vs 1.9/1.0/0.09 s), which is the expected direction.
+
+#### The abort this step fixes
+
+The new spec is the merge gate, in the same shape as `test.data-router-errors.spec.js`.
+Against pre-conversion code the *first* case takes the process down, so the remaining 11
+report `ECONNREFUSED`. The recorded log (`/tmp/eq-preconversion-crash.log`) is unambiguous:
+
+```
+POST /genome/ 400 156.041 ms          <- the self-call, correctly rejected
+Uncaught Expcetion. SyntaxError: Unexpected token 'A', "A Database"... is not valid JSON,
+  unhandledRejection
+UnhandledRejection. ... at ExpandingQuery.js:67:29
+POST /genome_feature/ - - [-] ms      <- the OUTER request; never completed, timed out at 20s
+POST /no_such_collection/ 404 10.484 ms
+  #  node[3816977]: void node::AsyncHooks::push_async_context(...) at ../src/env.cc:126
+  #  Assertion failed: (trigger_async_id) >= (-1)
+```
+
+All three triggers are ordinary client mistakes, unauthenticated, one request each:
+an undefined field in the sub-query, an unknown sub-query collection, and a smuggled
+`shards` parameter. This is the same chain as the `dataRouter` abort fixed in `31a1d5ad`,
+reached from a different route.
+
+Also confirmed live: the `{req:{}}` TypeError. Before the fix,
+`ResolveQuery('join(genome,eq(genome_id,83332.12),genome_id)', {req:{},res:{}})` killed the
+node process outright at `ExpandingQuery.js:60`; after, it returns
+`in(genome_id,(83332.12))`. That is `middleware/CrossCollectionSource.js`'s call path, so
+**any cross-collection download whose source filter contained `join()`/`GenomeGroup()`/
+`FeatureGroup()` was broken.** End-to-end check now passes: a `genome → genome_sequence`
+download with a `join()` source filter returns the same 1 contig as the plain-`eq()` control.
+
+#### Self-call elimination, observed
+
+After a restart, one `join()` POST to `/genome_feature/` and one
+`secondDegreeInteraction()` POST to `/ppi/` produce **exactly three** access-log lines —
+`GET /health`, `POST /genome_feature/`, `POST /ppi/`. The pre-conversion log for the same
+pair also contained `POST /genome/` and `GET /ppi/?…facet((field,feature_id_a)…` loopback
+entries.
+
+#### Two findings recorded rather than fixed
+
+- **A failed `join()` sub-query now propagates to a 400** instead of degrading to
+  `in(field,(NOT_A_VALID_ID))` → HTTP 200 with zero rows. There was no working behavior to
+  preserve — every reachable error hung the request instead — and silent-empty is the exact
+  failure mode this codebase warns about. `GenomeGroup()`/`FeatureGroup()` **keep** their
+  degradation, because that path is reachable and observed today; the new spec pins both.
+- **A broad join can pin the event loop.** `join(genome,eq(genome_status,Complete),genome_id)`
+  facets to tens of thousands of ids, and parsing the resulting `in(genome_id,(...))` took the
+  dev server to 3.3 GB RSS with `/health` unanswerable. Unchanged by this conversion (the RQL
+  parse is the same either way) — it is `PLAN_SOLR_OVERLOAD_PROTECTION.md` territory. It is
+  also why the probe set uses an explicit three-genome `in()` rather than a status filter.
 
 ### Run the test suites against the DEV server, not :3001
 
@@ -457,7 +552,19 @@ blocker on changing it is the non-user-scoped `apicache` key — not the transpo
 tempted to "improve" this by threading the caller's identity must user-key the cache in the
 same change or they create a cross-user leak.
 
-### Stage 3 — `ExpandingQuery.js` (the deadlock case)
+### Stage 3 — `ExpandingQuery.js` (the deadlock case) — DONE
+
+**Shipped.** Everything in this section was carried out as written; the verification record
+is under "Verification results for step 6" above. One thing the plan did not anticipate: the
+conversion introduces a **require cycle**, `ExpandingQuery → lib/internalQuery →
+middleware/RQLQueryParser → ExpandingQuery`, and it is not benign. `RQLQueryParser` assigns
+`module.exports = function (…)`, replacing the exports object, so whichever module in the
+ring loads first captures a stale `{}` for its partner — verified: loading `lib/internalQuery`
+first leaves `ExpandingQuery`'s `internalQuery` binding `undefined`, and nothing complains
+until a query actually needs it. `internalQuery` only wanted one function from the
+middleware, so `sanitizeErrorMessage` was extracted to `lib/sanitizeErrorMessage.js` and the
+edge removed. `RQLQueryParser` still re-exports it, so `routes/multiQuery.js` is unchanged.
+All three load orders were re-checked afterwards.
 
 `runJoinQuery` (`:56`) and `runSDISubQuery` (`:82`) fire **during `RQLQueryParser`** — a
 self-call nested inside the outer request's own middleware chain, and recursive for nested

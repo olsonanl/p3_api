@@ -40,9 +40,11 @@ direction gives every worker `Cannot find module …`. Verify before restarting:
 node -e "require('dojo-declare/declare'); require('./lib/solrjs'); console.log('deps OK')"
 ```
 
-**Offline-suite baseline on master is 327 passing / 1 failing** — the known
-`fastaHeaderFormatter` case. (On `feature/eliminate-self-call` it is 350/1; that branch adds
-23 tests.)
+**Offline-suite baseline is 327 passing / 1 failing** — the known `fastaHeaderFormatter`
+case — on master *and* on `feature/eliminate-self-call`. An earlier note here said 350/1 on
+that branch; that was wrong. Every spec the branch adds needs a live API and a populated
+Solr, so none of them land in `test-util`/`test-join`/`test-distributed`. Measure the branch's
+own additions with the command in `PLAN_ELIMINATE_SELF_CALL.md`, against `:23001`.
 
 **`distributedQuery` defaults to `enabled: true` with an empty `excludeNodes`,** and the path
 needs direct network access to every Solr replica, which the production deployment does not
@@ -85,6 +87,8 @@ Shipped so far on the branch (based on `6397c6cf`, pushed to `upstream`):
 - **`73e5d2a3`** — `multiQuery` converted.
 - **`31a1d5ad`** — `dataRouter` converted (3 sites; `/taxon_category/` was already
   in-process). Also fixes a **production-crash defect** — see below.
+- **`5a36bf72`** — `ExpandingQuery` converted (`runJoinQuery`, `runSDISubQuery`). Fixes the
+  **same abort from a second route** and a live cross-collection-download break; see below.
 
 Two invariants for anything built on `internalQuery`:
 
@@ -97,8 +101,20 @@ Two invariants for anything built on `internalQuery`:
   via `app.param('dataType')`; callers build the target from client-supplied input, so
   bypassing HTTP would otherwise allow a query against an arbitrary Solr core.
 
-Remaining: `ExpandingQuery` (step 6), then a wall-clock deadline in `util/http.js` (step 7).
-Status table and pickup instructions are at the top of the plan.
+A third invariant, learned in step 6: **`lib/internalQuery.js` must not require anything
+under `middleware/`.** Doing so closes a cycle through `ExpandingQuery`, and the cycle is not
+benign — `RQLQueryParser` assigns `module.exports = function (…)`, replacing the exports
+object, so whichever module loads first captures a stale `{}` for its partner and the failure
+surfaces only when a query needs it. That is why `sanitizeErrorMessage` lives in
+`lib/sanitizeErrorMessage.js` and is merely *re-exported* from `RQLQueryParser`.
+
+Remaining: a wall-clock deadline in `util/http.js` (step 7). Status table and pickup
+instructions are at the top of the plan.
+
+The 9 RPC self-call sites are deliberately deferred (the RPC identity model is
+client-supplied `params[1].token`, validated only by the inner self-call). `bundler/genome.js`
+and `util/featureSequence.js:12,29` also self-call and were never in the 17-site tally; they
+carry the same `JSON.parse` shape and are unaudited.
 
 #### `JSON.parse` on a self-call body is how a worker dies
 
@@ -126,13 +142,24 @@ curl -H 'Accept: application/solr+json' http://localhost:23001/data/taxon_catego
 The 22 native frames match `api.err.crash-162500` exactly, and the production log lines
 immediately before that abort are `dataRouter.js:60` and `:157` self-calls timing out at 120s.
 
-**Fixed in `dataRouter` by `31a1d5ad`; the pattern is still live elsewhere.** Other
-`JSON.parse`-on-a-self-call-body sites, each needing the same audit — does its promise have a
-rejection handler?
+**`ExpandingQuery` had the same defect, and it did not need a malformed *outer* query.**
+`runJoinQuery` did `JSON.parse(body).facet_counts.facet_fields[field]` inside the **success**
+handler of a `.then(ok, fail)` pair — which `fail` does not catch — so a sub-query error took
+the identical path. Three ordinary client mistakes each killed the worker 3/3, unauthenticated,
+one request apiece: an undefined field in the sub-query, an unknown sub-query collection, and
+a smuggled `shards` parameter (the sanitizer *correctly* 400s that one; the 400 is what did
+the damage on the way back). Note the second variant of the chain — when the body *is* valid
+JSON, `JSON.parse` succeeds and the `.facet_counts` dereference throws instead. Same outcome.
+Fixed in step 6; regression test is `tests/test-api/test.expanding-errors.spec.js`, which
+takes the pre-conversion worker down on its first case.
 
-`ExpandingQuery.js:21,26,67,91` · `rpc/proteinFamily.js:51,118,131` · `rpc/msa.js:28` ·
+**Fixed in `dataRouter` by `31a1d5ad` and in `ExpandingQuery` by step 6; the pattern is still
+live elsewhere.** Other `JSON.parse`-on-a-self-call-body sites, each needing the same audit —
+does its promise have a rejection handler, and is the parse in the `ok` or the `fail` arm?
+
+`rpc/proteinFamily.js:51,118,131` · `rpc/msa.js:28` ·
 `rpc/biosetResult.js:27,52` · `rpc/transcriptomicsGene.js:30,95,97,141,166,247` ·
-`routes/indexer.js:151`
+`routes/indexer.js:151` · `bundler/genome.js` · `util/featureSequence.js`
 
 Two things make this worse than it looks. `app.js:34` swallowing `uncaughtException` converts
 a clean crash into silent state corruption that surfaces later on an unrelated request, so
@@ -151,6 +178,43 @@ wrapped in `cacheWithRedis('1 day')` whose key is `req.originalUrl` with `append
 is **not user-scoped**. An identity reaching these queries would publish one user's private
 counts to every subsequent requester for 24 hours. Making these counts private-aware requires
 scoping the cache key first.
+
+#### `join()` identity, and the two expanders that differ
+
+The RQL expanders in `ExpandingQuery.js` do **not** share one identity policy. Each choice is
+deliberate:
+
+- **`runJoinQuery` forwards the caller** (`opts.req.user`), preserving what the self-call did
+  with `opts.req.headers['authorization']`. A user joining against their own private genomes
+  must still see them.
+- **`runSDISubQuery` is pinned anonymous** (`user: undefined`). It *looks* like it forwarded,
+  but its only call site passes no `opts` at all, so it always was; `ppi` is `publicFree`, so
+  today this is moot either way. It is pinned explicitly, with a comment, rather than
+  silently promoted.
+
+Two behavior notes for this file:
+
+- **A failed `join()` sub-query now returns 400** rather than degrading to
+  `in(field,(NOT_A_VALID_ID))` → HTTP 200 with zero rows. Nothing was lost: before the
+  conversion every reachable error *hung* instead of degrading. `GenomeGroup()` and
+  `FeatureGroup()` **keep** their degradation — that path is reachable and clients depend on
+  the empty answer. `tests/test-api/test.expanding-errors.spec.js` pins both.
+- **A broad `join()` can pin the event loop.** `join(genome,eq(genome_status,Complete),genome_id)`
+  facets to tens of thousands of ids and parsing the resulting `in(genome_id,(...))` took the
+  dev server to 3.3 GB RSS with `/health` unanswerable. This is the RQL parse, not the
+  transport, so the conversion neither caused nor cured it — see
+  `PLAN_SOLR_OVERLOAD_PROTECTION.md`.
+
+#### `ResolveQuery` needs the real `req`, not `{}`
+
+`ExpandingQuery.ResolveQuery(rql, { req, res })` reads `req.user` (permission scope for join
+sub-queries) and `req.headers.authorization` (the Workspace API). Passing `{}` used to throw a
+`TypeError` on the unguarded `req.headers` deref, inside an unwatched promise — which killed
+the process. That is fixed, but the trap moved rather than vanished: with the guard in place,
+`{}` now resolves **anonymously and silently**, dropping the caller's private rows.
+`middleware/CrossCollectionSource.js` was the one caller doing this, so **every
+cross-collection download whose source filter contained `join()`/`GenomeGroup()`/
+`FeatureGroup()` was broken**; it now threads the real `req`. Any new caller must too.
 
 ### Facet counts cannot be corrected inside Solr
 
@@ -1001,6 +1065,7 @@ Every bug found in this feature produced a plausible-looking file with HTTP 200.
 - **Pass an explicit `rows` to `fetchByIds` for one-to-many links.** It defaults to `values.length`, assuming one target doc per key — true for md5→sequence, false for `genome_id`→contigs. A 105-contig download returned 2 records.
 - **Union serializer join keys into the target `fl`.** The FASTA serializers join to `feature_sequence` on `aa_sequence_md5`/`na_sequence_md5`, which no client `select()` would name. `JoinFieldInjector` protects the ordinary path; this path bypasses it. Missing it yields correct headers with empty sequences (`SERIALIZER_REQUIRED_FIELDS` in `CrossCollectionStream.js`).
 - **Read the source RQL from `req._originalRql`**, captured before `RQLQueryParser` rewrites `call_params[0]` against the target. `req._rawBody` only exists for `application/x-www-form-urlencoded`; relying on it dropped the filter for `rqlquery+...` requests, so the download silently resolved the *entire* source collection.
+- **Pass the real `req` to `Expander.ResolveQuery`, not `{}`.** This call site did the latter, so a source filter containing `join()`/`GenomeGroup()`/`FeatureGroup()` crashed the worker; with that guarded it would instead resolve anonymously and drop the user's own private rows. See "`ResolveQuery` needs the real `req`" above.
 - **Permission-scope every collection independently** — source, target, and each `enrichDocsChained` hop. They differ in `publicFree` status.
 
 ### Result counts are not readable from headers
