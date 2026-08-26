@@ -2,7 +2,18 @@
 
 ## STATUS (2026-08-26) — steps 1–4 done, step 5 next
 
-Branch `feature/eliminate-self-call`, pushed to `upstream`, based on `6397c6cf` (master).
+Branch `feature/eliminate-self-call`, based on `6397c6cf` (master).
+
+**There is no remote named `upstream`** — earlier notes in this file said "pushed to
+upstream" and that is wrong. The two remotes are `origin`
+(`https://github.com/BV-BRC/BV-BRC-API`, canonical) and `bob`
+(`git@github.com:olsonanl/p3_api`, personal fork). They are at *different* points:
+
+| ref | tip |
+|---|---|
+| `origin/feature/eliminate-self-call` | `797adf86` |
+| `bob/feature/eliminate-self-call` | `ee4c56b8` (4 behind origin) |
+| local `HEAD` | `c42d88a0` (3 ahead of origin) |
 
 | step | state | commit |
 |---|---|---|
@@ -15,7 +26,8 @@ Branch `feature/eliminate-self-call`, pushed to `upstream`, based on `6397c6cf` 
 | 7. `util/http.js` wall-clock deadline | not started | — |
 | 8. `CLAUDE.md` pass | not started | — |
 
-**Nothing after `ee4c56b8` has been pushed.** `c868a061` and `73e5d2a3` are local only.
+**Three commits are local only** — `c868a061`, `73e5d2a3`, `c42d88a0`. Nothing has been
+pushed to either remote since `797adf86`.
 Working tree is clean of plan work; the untracked files in `git status` (`token.*`,
 `p3api.conf`, `*.log`, `dq*`, `solrq*`, `tst*`) are pre-existing secrets and scratch —
 **always `git add` by name, never `-A`.**
