@@ -9,11 +9,42 @@ Branch `feature/eliminate-self-call`, pushed to `upstream`, based on `6397c6cf` 
 | 1. `multiQuery` error propagation | **done** | `febb9cf8` |
 | 2. `lib/internalQuery.js` + tests | **done** (inert — no call sites converted) | `fcee5a0a` |
 | 3. `/data` characterization tests | **done** | `c868a061` |
-| 4. Convert `multiQuery` | **done** — first live caller | see below |
-| 5. Convert `dataRouter` | **NEXT** | — |
+| 4. Convert `multiQuery` | **done** — first live caller | `73e5d2a3` |
+| 5. Convert `dataRouter` | **NEXT** — not started, findings below | — |
 | 6. Convert `ExpandingQuery` | not started | — |
 | 7. `util/http.js` wall-clock deadline | not started | — |
 | 8. `CLAUDE.md` pass | not started | — |
+
+**Nothing after `ee4c56b8` has been pushed.** `c868a061` and `73e5d2a3` are local only.
+Working tree is clean of plan work; the untracked files in `git status` (`token.*`,
+`p3api.conf`, `*.log`, `dq*`, `solrq*`, `tst*`) are pre-existing secrets and scratch —
+**always `git add` by name, never `-A`.**
+
+Dev server: port `23001`, log `/tmp/devserver.log`. Production is a *separate* pm2 process
+(`p3-api`, user `svcbvbrc`) on port `3001` — do not touch it, and see the `API_URL` warning
+below.
+
+### Verification results for step 4 (all green as of 2026-08-26)
+
+| suite | result |
+|---|---|
+| offline set (command below) | **366 passing / 1 failing** (known `fastaHeaderFormatter`) |
+| `tests/test-permissions/test.internalquery.spec.js` | 19/19 |
+| `tests/test-security/security-internalquery-ssrf.spec.js` | 10/10 (new) |
+| `tests/test-api/test.multiquery-errors.spec.js` | 10/10 (was 4) |
+| `tests/test-api/test.data-router.spec.js` | 15/15 *against `:23001`* |
+| all four live specs together | 36 passing / 0 failing |
+| `npx eslint` on the 5 changed files | 1 error, pre-existing (`RQLQueryParser.js:9`) |
+
+Behavioral evidence beyond the suites, in case it needs re-checking rather than re-deriving:
+a 16-probe before/after capture against the same live Solr diffs to **8 lines, all error
+*detail* strings with unchanged status codes** (5 SSRF probes gained the sanitizer's reason,
+2 unknown-collection gained the collection name, 1 `descendants()` surfaced Solr's real
+message). Every success line is byte-identical. An authenticated A/B (dev `:23001` new code
+vs prod `:3001` old code, same Solr) matched on `private_genomes`, `public_ctl` and
+`private_features` — 5 private rows authenticated, 0 anonymous, both directions.
+`own_genomes` differs only because production still carries the silent-200 bug fixed in
+`febb9cf8`.
 
 ### Run the test suites against the DEV server, not :3001
 
@@ -299,6 +330,38 @@ behavior (`Authorization: ''` hardcoded at `dataRouter.js:26`) and is required f
   into a shared cache served to every user.
 
 `publicFree` must still be passed (fail-closed rule above); only `user` is omitted.
+
+#### What a read of `dataRouter.js` turned up (2026-08-26, not yet reproduced live)
+
+From reading the file only — worth confirming against the dev server before relying on it,
+but it changes what step 5 has to do:
+
+- **`dataRouter.js:21` uses `httpRequest`, not `httpRequestWithStatus`.** So it has the same
+  swallowed-status defect `febb9cf8` fixed in multiQuery: a non-2xx body is `JSON.parse`d and
+  handed to the caller as if it were a result. The three call sites then diverge, and they
+  are **not equally bad**:
+  - `/distinct` (`:160-168`) has an explicit `else next({status, message})`. Handled.
+  - `summary_by_taxon` (`:65`) reads `results.facet_counts.facet_fields.feature_type` off the
+    error body, throws a `TypeError`, `Promise.all` rejects, `next(err)` → 500. Ugly message,
+    but it does surface.
+  - **`subsystem_summary` (`:221`) has an `if` with no `else`.** On an error body the
+    condition is false, so `next()` is never called and nothing is ever written — **the
+    request hangs** until the client gives up. Nothing downstream responds; `cacheWithRedis`
+    and `bodyParser` impose no deadline. This is the worst of the three and step 5 should
+    close it. (Its condition also tests `body.facet_counts.facet_pivot` twice — a typo, not a
+    second check.)
+- **`/taxon_category/` (`:176`) has no self-call to convert.** It already runs in-process via
+  `RQLQueryParser → APIMethodHandler → media`. Step 5 leaves its transport alone; it is only
+  interesting because it is the endpoint with no permission filter (item 2 under
+  "Documented-but-not-fixed") and the only one of the four **not** wrapped in
+  `cacheWithRedis`.
+- **`/distinct` interpolates `req.query.q` raw into the Solr query** (`:155`, `:157`), with no
+  escaping. It is not currently an injection hole *because* the self-call routes it through
+  `SolrQuerySanitizer`. `internalQuery` carries that same gate (added in `73e5d2a3`), so the
+  conversion preserves the protection — but that is load-bearing, so pin it with a test
+  rather than leaving it implicit.
+
+So step 5 is three conversions, not four, and it inherits an error-handling fix.
 
 **Documented limitation (requested).** Add a comment block at the `/data` subQuery site and
 a short subsection in `CLAUDE.md` recording that **all `/data/*` summary endpoints report
