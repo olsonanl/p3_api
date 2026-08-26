@@ -1,6 +1,6 @@
 # feature/eliminate-self-call — remove HTTP self-calls from the hot path
 
-## STATUS (2026-08-26) — steps 1–4 done, step 5 next
+## STATUS (2026-08-26) — steps 1–5 done, step 6 next
 
 Branch `feature/eliminate-self-call`, based on `6397c6cf` (master).
 
@@ -13,7 +13,7 @@ upstream" and that is wrong. The two remotes are `origin`
 |---|---|
 | `origin/feature/eliminate-self-call` | `797adf86` |
 | `bob/feature/eliminate-self-call` | `ee4c56b8` (4 behind origin) |
-| local `HEAD` | `c42d88a0` (3 ahead of origin) |
+| local `HEAD` | `31a1d5ad` (5 ahead of origin) |
 
 | step | state | commit |
 |---|---|---|
@@ -21,13 +21,20 @@ upstream" and that is wrong. The two remotes are `origin`
 | 2. `lib/internalQuery.js` + tests | **done** (inert — no call sites converted) | `fcee5a0a` |
 | 3. `/data` characterization tests | **done** | `c868a061` |
 | 4. Convert `multiQuery` | **done** — first live caller | `73e5d2a3` |
-| 5. Convert `dataRouter` | **NEXT** — not started, findings below | — |
-| 6. Convert `ExpandingQuery` | not started | — |
+| 5. Convert `dataRouter` | **done** — also fixes a production abort | `31a1d5ad` |
+| 6. Convert `ExpandingQuery` | **NEXT** — not started | — |
 | 7. `util/http.js` wall-clock deadline | not started | — |
-| 8. `CLAUDE.md` pass | not started | — |
+| 8. `CLAUDE.md` pass | partially done in `31a1d5ad`'s follow-up commit | — |
 
-**Three commits are local only** — `c868a061`, `73e5d2a3`, `c42d88a0`. Nothing has been
-pushed to either remote since `797adf86`.
+**Five commits are local only** — `c868a061`, `73e5d2a3`, `c42d88a0`, `31a1d5ad`, and the
+doc commit after it. Nothing has been pushed to either remote since `797adf86`.
+
+**Open question for the maintainer:** the `dataRouter` crash fix is entangled with the
+refactor in `31a1d5ad`. Production runs the unfixed code and this defect is reachable by any
+unauthenticated client with one malformed query string. If it should be hotfixed onto
+`master` ahead of this branch, the minimal backport is `failSubQuery` + the two missing
+`else` branches, which does **not** require `internalQuery` — but it does require
+`httpRequestWithStatus` from `febb9cf8` to tell an error body from a real one.
 Working tree is clean of plan work; the untracked files in `git status` (`token.*`,
 `p3api.conf`, `*.log`, `dq*`, `solrq*`, `tst*`) are pre-existing secrets and scratch —
 **always `git add` by name, never `-A`.**
@@ -343,25 +350,59 @@ behavior (`Authorization: ''` hardcoded at `dataRouter.js:26`) and is required f
 
 `publicFree` must still be passed (fail-closed rule above); only `user` is omitted.
 
-#### What a read of `dataRouter.js` turned up (2026-08-26, not yet reproduced live)
+#### What `dataRouter.js` actually did (corrected 2026-08-26 against the dev server)
 
-From reading the file only — worth confirming against the dev server before relying on it,
-but it changes what step 5 has to do:
+An earlier draft of this section was written from reading the file and **got the important
+part wrong**. Both corrections are recorded because the wrong version was more comforting
+than the truth:
 
-- **`dataRouter.js:21` uses `httpRequest`, not `httpRequestWithStatus`.** So it has the same
-  swallowed-status defect `febb9cf8` fixed in multiQuery: a non-2xx body is `JSON.parse`d and
-  handed to the caller as if it were a result. The three call sites then diverge, and they
-  are **not equally bad**:
-  - `/distinct` (`:160-168`) has an explicit `else next({status, message})`. Handled.
-  - `summary_by_taxon` (`:65`) reads `results.facet_counts.facet_fields.feature_type` off the
-    error body, throws a `TypeError`, `Promise.all` rejects, `next(err)` → 500. Ugly message,
-    but it does surface.
-  - **`subsystem_summary` (`:221`) has an `if` with no `else`.** On an error body the
-    condition is false, so `next()` is never called and nothing is ever written — **the
-    request hangs** until the client gives up. Nothing downstream responds; `cacheWithRedis`
-    and `bodyParser` impose no deadline. This is the worst of the three and step 5 should
-    close it. (Its condition also tests `body.facet_counts.facet_pivot` twice — a typo, not a
-    second check.)
+- ~~"`/distinct` has an explicit `else next({status, message})`. Handled."~~ **`/distinct` was
+  the one that hung**, and it is the entry point to a process abort. Its `.then()` had no
+  *rejection* handler, which is a different thing from having an `else`. The `else` never ran
+  because `JSON.parse` threw before the callback was reached.
+- ~~"`subsystem_summary` has an `if` with no `else` … this is the worst of the three."~~ The
+  missing `else` was real (and is fixed), but `subsystem_summary` had a rejection handler at
+  `:273`, so it answered 400 rather than hanging. It was the *least* bad of the three.
+
+What live probing established:
+
+- **`dataRouter.js:21` used `httpRequest`, not `httpRequestWithStatus`** — the same
+  swallowed-status defect `febb9cf8` fixed in multiQuery. But the failure is worse here than
+  "a non-2xx body handed back as a result", because an inner error body is the plain-text
+  string `"A Database Error Occured: …"`, so `JSON.parse` **throws** rather than returning a
+  bogus object.
+- `/distinct` → `SyntaxError` in a promise with no rejection handler → unhandled rejection →
+  `--unhandled-rejections=strict` → `uncaughtException` → **swallowed by `app.js:34`** →
+  request hangs forever holding a worker slot → `async_hooks` state corrupt → **the next
+  Solr-backed request aborts the process** with
+  `node::AsyncHooks::push_async_context … Assertion failed: (trigger_async_id) >= (-1)`.
+- `summary_by_taxon` → `Promise.all` rejects → `next(err)` → 500. Surfaced, as predicted.
+- `subsystem_summary` → rejection handler → 400.
+
+**Reproducer (3/3, with a control):**
+
+```bash
+curl 'http://localhost:23001/data/distinct/genome/host_group?q=foo%3A%28'            # hangs
+curl -H 'Accept: application/solr+json' http://localhost:23001/data/taxon_category/  # aborts
+```
+
+Bisected: the malformed-`q` request alone is sufficient as the first half; the smuggled-`shards`
+probe is not, and a no-probe control leaves the process healthy. The follow-up matters too —
+a `POST /genome/` did **not** trigger the abort in 3 trials while `/data/taxon_category/` did
+3/3, so the second request's shape is part of the trigger and the abort should be treated as
+**probabilistic in production**, not guaranteed on every malformed query.
+
+The 22 native frames match the recorded production abort `api.err.crash-162500` exactly, and
+the log lines immediately preceding that crash are `dataRouter.js:60` and `:157` self-calls
+timing out at 120s. So this is not a theoretical path — it is how at least one production
+worker died.
+
+**Generalization worth carrying into steps 6–7:** the guilty pattern is
+`JSON.parse(<self-call body>)` in a promise whose rejection nobody handles. Remaining sites
+are listed in `CLAUDE.md` under "`JSON.parse` on a self-call body is how a worker dies".
+`ExpandingQuery.js:21,26,67,91` is step 6's problem specifically. Note also that `app.js:34`
+swallowing `uncaughtException` is what converts a clean crash into delayed corruption on an
+unrelated request — worth revisiting on its own.
 - **`/taxon_category/` (`:176`) has no self-call to convert.** It already runs in-process via
   `RQLQueryParser → APIMethodHandler → media`. Step 5 leaves its transport alone; it is only
   interesting because it is the endpoint with no permission filter (item 2 under
@@ -373,7 +414,41 @@ but it changes what step 5 has to do:
   conversion preserves the protection — but that is load-bearing, so pin it with a test
   rather than leaving it implicit.
 
-So step 5 is three conversions, not four, and it inherits an error-handling fix.
+So step 5 was three conversions, not four, and it inherited an error-handling fix.
+
+### Verification results for step 5 (all green as of 2026-08-26)
+
+| suite | result |
+|---|---|
+| `tests/test-api/test.data-router.spec.js` (characterization) | 15/15, unchanged |
+| `tests/test-api/test.data-router-errors.spec.js` (**new**) | 15/15 |
+| `tests/test-api/test.multiquery-errors.spec.js` | 10/10 |
+| `tests/test-permissions/test.internalquery.spec.js` | 19/19 |
+| `tests/test-security/security-internalquery-ssrf.spec.js` | 10/10 |
+| all five live specs together | **69 passing / 0 failing** |
+| offline suites | 362 passing / 1 failing (known `fastaHeaderFormatter`) |
+| `tests/test-security/` | 50 passing / 1 failing — **pre-existing**, byte-identical before the change (`should allow legitimate queries`, a `GET /genome/?q=…` case unrelated to `/data`) |
+| `npx eslint routes/dataRouter.js tests/…-errors.spec.js` | clean |
+
+**The new error spec is a real gate:** 7 of its 15 cases fail against the pre-conversion
+code, 3 of them by hanging. Verified by `git stash push routes/dataRouter.js`, restarting,
+and re-running.
+
+**Before/after capture.** 16 probes, cold Redis (dev **db 3** — never flush db 2, it is
+production's), canonicalized JSON so `summary_by_taxon`'s `Object.assign` key-order race does
+not read as a diff. **15 of 16 byte-identical.** The one change:
+
+| probe | before | after |
+|---|---|---|
+| `distinct/smuggled-shards` | `500 {"message":"Interal Server Error"}` | `400 {"message":"Unable to query"}` |
+
+Both reject the payload; the 500 came from `next({status: undefined, message: undefined})`
+reading `.msg` off a string. The three pathological probes moved from **HANG / HANG / 500**
+to **400 / 400 / 400**, and the abort reproducer is 3/3 `ALIVE` where it was 3/3 `ABORTED`.
+
+Scripts, if this needs re-running: `/tmp/dr-capture.js` (probe set, `--patho` for the
+crashing group), `/tmp/dr-server.sh` (restart helper — note it kills by pid from `pgrep`,
+because `pkill -f 'stack-size=7000 app.js'` also matches the calling shell and kills it).
 
 **Documented limitation (requested).** Add a comment block at the `/data` subQuery site and
 a short subsection in `CLAUDE.md` recording that **all `/data/*` summary endpoints report

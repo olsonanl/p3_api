@@ -82,6 +82,9 @@ Shipped so far on the branch (based on `6397c6cf`, pushed to `upstream`):
 - **`fcee5a0a`** — `lib/internalQuery.js`, inert until the conversions land. Goes **direct to
   Solr** rather than synthesizing a `req`/`res` and replaying the ~27-middleware chain,
   following the `media/genbank.js` precedent (`06dd7618`).
+- **`73e5d2a3`** — `multiQuery` converted.
+- **`31a1d5ad`** — `dataRouter` converted (3 sites; `/taxon_category/` was already
+  in-process). Also fixes a **production-crash defect** — see below.
 
 Two invariants for anything built on `internalQuery`:
 
@@ -94,9 +97,60 @@ Two invariants for anything built on `internalQuery`:
   via `app.param('dataType')`; callers build the target from client-supplied input, so
   bypassing HTTP would otherwise allow a query against an arbitrary Solr core.
 
-Remaining: `/data` characterization tests (**needs a live API + Solr** — that route has zero
-coverage and step 5 rewrites it), then the three conversions, then a wall-clock deadline in
-`util/http.js`. Status table and pickup instructions are at the top of the plan.
+Remaining: `ExpandingQuery` (step 6), then a wall-clock deadline in `util/http.js` (step 7).
+Status table and pickup instructions are at the top of the plan.
+
+#### `JSON.parse` on a self-call body is how a worker dies
+
+The self-calls are not only slow — one of them has been **aborting production workers**, and
+the mechanism generalizes to every remaining site. Chain, verified end to end locally:
+
+1. `util/http.js`'s `httpRequest` **discards `res.statusCode`** and resolves the body either
+   way. An inner error response is the plain-text `"A Database Error Occured: …"`, not JSON.
+2. `JSON.parse(body)` throws a `SyntaxError` **inside a promise**.
+3. If that promise has no rejection handler, the rejection is unhandled.
+4. `--unhandled-rejections=strict` (set in `package.json`'s `start`) turns it into an
+   `uncaughtException`, which **`app.js:34` swallows and continues past**.
+5. The request never reaches `next()` — it **hangs forever holding a worker slot**.
+6. `async_hooks` state is now corrupt, and the **next** Solr-backed request aborts the
+   process: `node::AsyncHooks::push_async_context … Assertion failed: (trigger_async_id) >= (-1)`.
+
+Reproduced **3/3** on the dev server from two unauthenticated GETs, with a control run
+confirming neither alone is sufficient:
+
+```bash
+curl 'http://localhost:23001/data/distinct/genome/host_group?q=foo%3A%28'   # hangs
+curl -H 'Accept: application/solr+json' http://localhost:23001/data/taxon_category/  # aborts
+```
+
+The 22 native frames match `api.err.crash-162500` exactly, and the production log lines
+immediately before that abort are `dataRouter.js:60` and `:157` self-calls timing out at 120s.
+
+**Fixed in `dataRouter` by `31a1d5ad`; the pattern is still live elsewhere.** Other
+`JSON.parse`-on-a-self-call-body sites, each needing the same audit — does its promise have a
+rejection handler?
+
+`ExpandingQuery.js:21,26,67,91` · `rpc/proteinFamily.js:51,118,131` · `rpc/msa.js:28` ·
+`rpc/biosetResult.js:27,52` · `rpc/transcriptomicsGene.js:30,95,97,141,166,247` ·
+`routes/indexer.js:151`
+
+Two things make this worse than it looks. `app.js:34` swallowing `uncaughtException` converts
+a clean crash into silent state corruption that surfaces later on an unrelated request, so
+the stack trace never names the guilty route. And an `if` with no `else` around a response —
+there were two in `dataRouter` — hangs by exactly the same mechanism without any exception at
+all.
+
+#### All `/data/*` counts are public-data-only
+
+`dataRouter`'s sub-queries run with **`user: undefined`**, matching the hardcoded
+`Authorization: ''` of the HTTP version they replaced. Private rows are never counted, for
+any caller, authenticated or not.
+
+**Do not "fix" this by forwarding the caller's identity.** Three of the four endpoints are
+wrapped in `cacheWithRedis('1 day')` whose key is `req.originalUrl` with `appendKey: []` — it
+is **not user-scoped**. An identity reaching these queries would publish one user's private
+counts to every subsequent requester for 24 hours. Making these counts private-aware requires
+scoping the cache key first.
 
 ### Facet counts cannot be corrected inside Solr
 
