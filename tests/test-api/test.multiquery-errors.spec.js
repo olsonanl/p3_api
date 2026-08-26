@@ -1,5 +1,5 @@
 /**
- * multiQuery sub-query error propagation.
+ * multiQuery sub-query error propagation and in-process dispatch.
  *
  * Guards the fix for a silent-200 bug: `util/http.js`'s `httpRequest` discards
  * `res.statusCode` and resolves the response body regardless, so multiQuery used to
@@ -9,58 +9,88 @@
  *
  * inside an outer HTTP 200. The website rendered an empty panel with no sign of failure.
  *
- * This suite is self-contained: it stands up a stub of the inner `/:dataType/` endpoint
- * and points the router at it via the `http_port` env var (nconf's `env()` store is
- * consulted before `file()`, so this overrides p3api.conf). No live API, Solr, or Redis.
- *
- * The load-bearing assertion is the negative one — that a failed sub-query does NOT get
- * an array-shaped `result`. Asserting only on the presence of `error` would still pass
+ * The load-bearing assertion is still the negative one — that a failed sub-query does NOT
+ * get an array-shaped `result`. Asserting only on the presence of `error` would still pass
  * if the old parse-into-result behavior came back alongside it.
+ *
+ * This suite used to stand up a stub of the inner `/:dataType/` endpoint and point the
+ * router at it via `http_port`, because multiQuery reached its own listening port over
+ * HTTP. That self-call is gone (PLAN_ELIMINATE_SELF_CALL.md step 4), so the seam moved:
+ * `lib/internalQuery` is stubbed in `require.cache` before the router is loaded. The stub
+ * also records its arguments, which lets the suite pin the two things that are easy to get
+ * silently wrong in the conversion — the 25000 row cap and identity forwarding.
+ *
+ * Still no live API, Solr, or Redis: stubbing the module means it is never evaluated, and
+ * the real ExpandingQuery makes no outbound call for RQL with no expandable terms.
  */
 const assert = require('chai').assert
 const express = require('express')
 const http = require('http')
 
 describe('multiQuery - sub-query error propagation', function () {
-  let innerServer, outerServer, outerPort, savedPort
+  let outerServer, outerPort, calls, behavior, internalQueryPath
 
   before(function (done) {
-    savedPort = process.env.http_port
+    calls = []
+    // Per-collection stub behavior, reset by each test that needs something specific.
+    behavior = {}
 
-    // Stub the inner endpoint multiQuery self-calls: one success, one JSON 500,
-    // one non-JSON 502 (an HTML error page from a proxy).
-    const inner = express()
-    inner.post('/genome', (req, res) =>
-      res.json([{ genome_id: '83332.12', genome_name: 'Mycobacterium tuberculosis H37Rv' }]))
-    inner.post('/genome_feature', (req, res) =>
-      res.status(500).json({ status: 500, message: 'A Database Error Occured' }))
-    inner.post('/pathway', (req, res) => {
-      res.status(502)
-      res.end('<html>bad gateway</html>')
-    })
+    internalQueryPath = require.resolve('../../lib/internalQuery')
 
-    innerServer = inner.listen(0, '127.0.0.1', () => {
-      process.env.http_port = String(innerServer.address().port)
+    function fakeInternalQuery (opts) {
+      calls.push(opts)
+      const fn = behavior[opts.collection]
+      if (!fn) {
+        const err = new Error(`Unknown collection: ${opts.collection}`)
+        err.statusCode = 404
+        return Promise.reject(err)
+      }
+      return fn(opts)
+    }
 
-      // Require AFTER setting the env var: config.js resolves at module load.
-      delete require.cache[require.resolve('../../config')]
-      delete require.cache[require.resolve('../../routes/multiQuery')]
-      const Router = require('../../routes/multiQuery')
+    // Install before requiring the router: multiQuery destructures `internalQuery` at
+    // module load, so patching the real module's exports afterwards would not be seen.
+    require.cache[internalQueryPath] = {
+      id: internalQueryPath,
+      filename: internalQueryPath,
+      loaded: true,
+      exports: { internalQuery: fakeInternalQuery, internalQueryDocs: () => Promise.resolve([]) }
+    }
 
-      const app = express()
-      app.use('/query', Router)
-      outerServer = app.listen(0, '127.0.0.1', () => {
-        outerPort = outerServer.address().port
-        done()
-      })
+    delete require.cache[require.resolve('../../routes/multiQuery')]
+    const Router = require('../../routes/multiQuery')
+
+    const app = express()
+    // app.js sets requestId globally before mounting /query; mirror that so the router
+    // has the same fields it does in production.
+    app.use(function (req, res, next) { req.requestId = 'test-rid'; next() })
+    app.use('/query', Router)
+    outerServer = app.listen(0, '127.0.0.1', () => {
+      outerPort = outerServer.address().port
+      done()
     })
   })
 
   after(function () {
-    if (innerServer) innerServer.close()
     if (outerServer) outerServer.close()
-    if (savedPort === undefined) delete process.env.http_port
-    else process.env.http_port = savedPort
+    delete require.cache[internalQueryPath]
+    delete require.cache[require.resolve('../../routes/multiQuery')]
+  })
+
+  beforeEach(function () {
+    calls = []
+    behavior = {
+      genome: () => Promise.resolve({
+        response: { numFound: 1, docs: [{ genome_id: '83332.12', genome_name: 'Mycobacterium tuberculosis H37Rv' }] }
+      }),
+      genome_feature: () => {
+        const err = new Error('A Database Error Occured')
+        err.statusCode = 500
+        return Promise.reject(err)
+      },
+      // No statusCode: an unclassified failure must still be reported, not swallowed.
+      pathway: () => Promise.reject(new Error('socket hang up'))
+    }
   })
 
   function postMulti (payloadObj) {
@@ -116,13 +146,71 @@ describe('multiQuery - sub-query error propagation', function () {
     assert.equal(body.failing.status, 500)
   })
 
-  it('handles a non-JSON error body without crashing', async function () {
+  it('defaults an unclassified failure to 500 rather than dropping the status', async function () {
     const { body } = await postMulti({
-      html: { dataType: 'pathway', query: 'eq(genome_id,83332.12)' }
+      hangup: { dataType: 'pathway', query: 'eq(genome_id,83332.12)' }
     })
-    assert.isUndefined(body.html.result)
-    assert.include(body.html.error, 'HTTP 502')
-    assert.equal(body.html.status, 502)
+    assert.isUndefined(body.hangup.result)
+    assert.include(body.hangup.error, 'HTTP 500')
+    assert.include(body.hangup.error, 'socket hang up')
+    assert.equal(body.hangup.status, 500)
+  })
+
+  it('reports an unknown collection as 404', async function () {
+    const { body } = await postMulti({
+      bad: { dataType: 'not_a_collection', query: 'eq(a,b)' }
+    })
+    assert.isUndefined(body.bad.result)
+    assert.include(body.bad.error, 'HTTP 404')
+    assert.equal(body.bad.status, 404)
+  })
+
+  it('rejects malformed RQL as 400', async function () {
+    // ExpandingQuery.ResolveQuery throws SYNCHRONOUSLY here (Query() is called before any
+    // promise exists), so this also guards against the try/catch being replaced by a bare
+    // .catch(), which would let the throw escape as an unhandled 500.
+    const { body } = await postMulti({
+      bad: { dataType: 'genome', query: 'this is not rql((((' }
+    })
+    assert.isUndefined(body.bad.result)
+    assert.equal(body.bad.status, 400)
+    assert.lengthOf(calls, 0, 'a query that cannot be parsed must never reach Solr')
+  })
+
+  it('caps sub-queries at the 25000-row HTTP limit, not internalQuery default of 50000', async function () {
+    // RQLQueryParser.js:106 uses 25000 for non-downloads; internalQuery defaults to
+    // MAX_LIMIT (50000). Passing the default would silently double the ceiling.
+    await postMulti({ ok: { dataType: 'genome', query: 'eq(genome_id,83332.12)&limit(30000)' } })
+    assert.lengthOf(calls, 1)
+    assert.equal(calls[0].maxLimit, 25000)
+  })
+
+  it('forwards the caller identity and request id to the sub-query', async function () {
+    await postMulti({ ok: { dataType: 'genome', query: 'eq(genome_id,83332.12)' } })
+    assert.lengthOf(calls, 1)
+    // Anonymous here (no token in this offline suite), but the key must be present and
+    // sourced from req.user — an omitted `user` would make every sub-query anonymous even
+    // for an authenticated caller, silently hiding their private rows.
+    assert.property(calls[0], 'user')
+    assert.equal(calls[0].requestId, 'test-rid')
+  })
+
+  it('returns the whole Solr response for application/solr+json', async function () {
+    const { body } = await postMulti({
+      s: { dataType: 'genome', query: 'eq(genome_id,83332.12)', accept: 'application/solr+json' }
+    })
+    assert.isObject(body.s.result)
+    assert.property(body.s.result, 'response')
+    assert.equal(body.s.result.response.numFound, 1)
+  })
+
+  it('returns grouped output when the query grouped instead of returning docs', async function () {
+    behavior.genome = () => Promise.resolve({ grouped: { genus: { matches: 3, groups: [] } } })
+    const { body } = await postMulti({
+      g: { dataType: 'genome', query: 'eq(genome_id,83332.12)' }
+    })
+    assert.isObject(body.g.result)
+    assert.property(body.g.result, 'genus')
   })
 
   it('does not let one failing sub-query take down the others', async function () {

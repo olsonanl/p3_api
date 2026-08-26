@@ -144,3 +144,8 @@ module.exports = function (req, res, next) {
     next()
   }
 }
+
+// Exported so lib/internalQuery.js can classify RQL errors exactly as this middleware
+// does. Callers that bypass HTTP still surface these messages to clients, so keeping one
+// implementation means the in-process and HTTP paths cannot drift on what gets stripped.
+module.exports.sanitizeErrorMessage = sanitizeErrorMessage

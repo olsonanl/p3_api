@@ -1,6 +1,6 @@
 # feature/eliminate-self-call — remove HTTP self-calls from the hot path
 
-## STATUS (2026-08-25) — steps 1–2 done, step 3 blocked on a live environment
+## STATUS (2026-08-26) — steps 1–4 done, step 5 next
 
 Branch `feature/eliminate-self-call`, pushed to `upstream`, based on `6397c6cf` (master).
 
@@ -8,30 +8,51 @@ Branch `feature/eliminate-self-call`, pushed to `upstream`, based on `6397c6cf` 
 |---|---|---|
 | 1. `multiQuery` error propagation | **done** | `febb9cf8` |
 | 2. `lib/internalQuery.js` + tests | **done** (inert — no call sites converted) | `fcee5a0a` |
-| 3. `/data` characterization tests | **NEXT — needs live API + Solr** | — |
-| 4. Convert `multiQuery` | not started | — |
-| 5. Convert `dataRouter` | not started | — |
+| 3. `/data` characterization tests | **done** | `c868a061` |
+| 4. Convert `multiQuery` | **done** — first live caller | see below |
+| 5. Convert `dataRouter` | **NEXT** | — |
 | 6. Convert `ExpandingQuery` | not started | — |
 | 7. `util/http.js` wall-clock deadline | not started | — |
 | 8. `CLAUDE.md` pass | not started | — |
+
+### Run the test suites against the DEV server, not :3001
+
+`tests/test-api/test.data-router.spec.js` defaults to `API_URL=http://localhost:3001`, which
+on this host is the **production** pm2 process (`svcbvbrc`), not the dev server on `:23001`.
+Running it bare silently characterizes a *different build*. It cost an hour here: two
+`/data/taxon_category/` tests failed with a Solr `ParseException` on `q=()` — production
+predates the empty-group guard in `lib/solrjs/rql.js`, so the empty group reaches Solr there
+and 400s, while the same request against `:23001` returns 200. Nothing to do with the
+conversion. Always:
+
+```bash
+API_URL=http://localhost:23001 npx mocha tests/test-api/test.data-router.spec.js
+```
+
+A characterization suite that can silently point at the wrong build is worse than no suite —
+it produces confident green on code you did not change.
 
 Also on the branch: `ee4c56b8`, the hang-investigation handoff
 (`Docs/HANG-INVESTIGATION-2026-08-24.md`) — unrelated incident, carried here so it is not
 stranded on a merged branch.
 
-**Test baseline on this branch: 350 passing / 1 failing.** The failure is the known
-pre-existing `fastaHeaderFormatter` case. Baseline was 327 before this work (+4 multiQuery
-error tests, +19 internalQuery tests). Run with:
+**Offline test baseline on this branch: 366 passing / 1 failing.** The failure is the known
+pre-existing `fastaHeaderFormatter` case. Baseline was 327 before this work (+10 multiQuery
+error tests, +19 internalQuery tests, +10 internalQuery SSRF tests). Run with:
 
 ```bash
 npx mocha -R dot tests/test-util/test.*.spec.js tests/test-join/test.*.spec.js \
   tests/test-distributed/test.*.spec.js tests/test-api/test.multiquery-errors.spec.js \
-  tests/test-permissions/test.internalquery.spec.js
+  tests/test-permissions/test.internalquery.spec.js \
+  tests/test-security/security-internalquery-ssrf.spec.js
 ```
 
-### Why step 3 needs a different machine
+`tests/test-api/test.data-router.spec.js` (15 tests) and `tests/test-api/test.multi.spec.js`
+need a live API and are not in that command — see the `API_URL` warning above.
 
-`/data/*` has **zero test coverage** today, and step 5 rewrites it. The characterization
+### Why step 3 needed a live environment (done — `c868a061`)
+
+`/data/*` had **zero test coverage**, and step 5 rewrites it. The characterization
 tests must capture the *current* HTTP behavior — real facet counts, real `json.facet`
 output — so the conversion can be held to byte-identical results. That requires a live API
 and a populated Solr; a mock would encode assumptions rather than reality, which is
