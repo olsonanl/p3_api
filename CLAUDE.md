@@ -57,13 +57,13 @@ Repo-root `PLAN_*.md` files are proposals, in varying states of vetting:
 
 | doc | subject |
 |---|---|
-| `PLAN_ELIMINATE_SELF_CALL.md` | **IN PROGRESS** — removing HTTP self-calls. Steps 1–2 shipped on `feature/eliminate-self-call`; see below. |
+| `PLAN_ELIMINATE_SELF_CALL.md` | **CODE COMPLETE, UNMERGED** — removing HTTP self-calls. All 8 steps shipped on `feature/eliminate-self-call`, local only; see below. |
 | `PLAN_PRIVATE_METADATA_OVERLAY.md` | Private per-user metadata collection overlaying `genome` — display, filter, facet. See below. |
 | `PLAN_GENOME_POSTFILTER.md` | JS-side post-filtering for negation-only `genome()` conditions |
 | `PLAN_DOWNLOAD_SSE_NOTIFICATIONS.md` | SSE start/complete events for downloads (hidden-form POSTs can't read headers) |
 | `PLAN_SOLR_OVERLOAD_PROTECTION.md` | Multi-layer throttling; broad-taxon join OOM mitigation |
 
-### HTTP self-calls (in progress — `feature/eliminate-self-call`)
+### HTTP self-calls (code complete on `feature/eliminate-self-call`, not merged)
 
 **The API calls its own listening port instead of invoking handlers in-process**, at 17
 sites. Over a 36-hour production window `::ffff:127.0.0.1` was the top client by a factor of
@@ -72,9 +72,16 @@ trip it is a resource-loop hazard — an outer request holds a slot in the same 
 children need, so parents can occupy every slot while children queue behind them.
 
 Find them with `grep -rn "get('http_port')" --include=*.js` (excluding `app.js`'s own
-`listen`). They are **identical on master and alpha** — no branch has ever fixed any of them.
+`listen`). They were **identical on master and alpha** — no released branch has fixed any of
+them, and none of the work below has been pushed to either remote yet.
 
-Shipped so far on the branch (based on `6397c6cf`, pushed to `upstream`):
+**There is no remote named `upstream`.** Earlier notes here and in the plan said "pushed to
+upstream"; that was wrong. The remotes are `origin`
+(`https://github.com/BV-BRC/BV-BRC-API`, canonical) and `bob`
+(`git@github.com:olsonanl/p3_api`, a personal fork), and everything after `797adf86` is
+local only.
+
+Shipped on the branch, which is based on `6397c6cf` (master):
 
 - **`febb9cf8`** — `multiQuery` no longer stores sub-query failures as results.
   `util/http.js`'s `httpRequest` discards `res.statusCode` and resolves the body regardless,
@@ -89,6 +96,14 @@ Shipped so far on the branch (based on `6397c6cf`, pushed to `upstream`):
   in-process). Also fixes a **production-crash defect** — see below.
 - **`6b1335e4`** — `ExpandingQuery` converted (`runJoinQuery`, `runSDISubQuery`). Fixes the
   **same abort from a second route** and a live cross-collection-download break; see below.
+- **`3fc64ead`** — wall-clock deadline in `util/http.js`. See "Outbound request timeouts"
+  below; that section's two gaps are now closed.
+
+That is the whole of the branch's code scope. **All three hot-path self-callers
+(`multiQuery`, `dataRouter`, `ExpandingQuery`) are converted**; the remaining `http_port`
+matches are `app.js`'s own `listen`, the 10 deferred RPC sites, `bundler/genome.js:10`, and
+`util/featureSequence.js:12,29`. Status table and pickup instructions are at the top of the
+plan.
 
 Two invariants for anything built on `internalQuery`:
 
@@ -108,16 +123,12 @@ object, so whichever module loads first captures a stale `{}` for its partner an
 surfaces only when a query needs it. That is why `sanitizeErrorMessage` lives in
 `lib/sanitizeErrorMessage.js` and is merely *re-exported* from `RQLQueryParser`.
 
-- **`3fc64ead`** — wall-clock deadline in `util/http.js` (step 7). See "Outbound request
-  timeouts" below; that section's two gaps are now closed.
-
-All code steps are done; only the documentation pass remains. Status table and pickup
-instructions are at the top of the plan.
-
-The 9 RPC self-call sites are deliberately deferred (the RPC identity model is
-client-supplied `params[1].token`, validated only by the inner self-call). `bundler/genome.js`
-and `util/featureSequence.js:12,29` also self-call and were never in the 17-site tally; they
-carry the same `JSON.parse` shape and are unaudited.
+The 10 RPC self-call sites are deliberately deferred (the RPC identity model is
+client-supplied `params[1].token`, validated only by the inner self-call — see item 4 of
+"Five defects" below). `bundler/genome.js` and `util/featureSequence.js:12,29` also
+self-call and were never in the 17-site tally; they carry the same `JSON.parse` shape.
+`bundler/genome.js` is still unaudited; `util/featureSequence.js:29` turned out to be dead
+code (item 5).
 
 #### `JSON.parse` on a self-call body is how a worker dies
 
@@ -158,11 +169,38 @@ takes the pre-conversion worker down on its first case.
 
 **Fixed in `dataRouter` by `31a1d5ad` and in `ExpandingQuery` by step 6; the pattern is still
 live elsewhere.** Other `JSON.parse`-on-a-self-call-body sites, each needing the same audit —
-does its promise have a rejection handler, and is the parse in the `ok` or the `fail` arm?
+three questions, because there turned out to be three ways in: does its promise have a
+rejection handler, is the parse in the `ok` or the `fail` arm, and **does its `catch`
+actually `return`?**
 
 `rpc/proteinFamily.js:51,118,131` · `rpc/msa.js:28` ·
-`rpc/biosetResult.js:27,52` · `rpc/transcriptomicsGene.js:30,95,97,141,166,247` ·
+`rpc/biosetResult.js:27,52` · `rpc/transcriptomicsGene.js:30,95,97,141,146,166,247` ·
 `routes/indexer.js:151` · `bundler/genome.js` · `util/featureSequence.js`
+
+**`rpc/transcriptomicsGene.js:141` is the worked example of the third question, and it is
+live — it took the dev worker down during step 7's test runs, on both codepaths.**
+`readPublicExperiments` wraps everything in `new Promise(async (resolve, reject) => …)`, an
+async executor, so anything thrown inside becomes an unhandled rejection of the inner async
+function rather than rejecting the outer promise. Then:
+
+```js
+let response
+try {
+  response = JSON.parse(res)
+} catch (err) {
+  reject(new Error(`readPublicExperiments(): Error parsing JSON from SOLR: ${err}`))
+}          // <- no return; execution continues
+
+const numFound = response.response.numFound   // response is undefined -> TypeError
+```
+
+The `catch` looks like it handles the error. It rejects, but it does not `return`, so control
+falls straight through to a deref of `undefined`. The resulting `TypeError: Cannot read
+properties of undefined (reading 'numFound')` then takes the documented six-step path to an
+aborted worker. Observed identically in the pre-change and post-change logs; step 7's deadline
+did not cause it, it only made it fire sooner by letting the caller give up and issue the next
+Solr-backed request. Deferred with the rest of the RPC sites — but of the deferred set this is
+the one with a confirmed live abort.
 
 Two things make this worse than it looks. `app.js:34` swallowing `uncaughtException` converts
 a clean crash into silent state corruption that surfaces later on an unrelated request, so
@@ -181,6 +219,13 @@ wrapped in `cacheWithRedis('1 day')` whose key is `req.originalUrl` with `append
 is **not user-scoped**. An identity reaching these queries would publish one user's private
 counts to every subsequent requester for 24 hours. Making these counts private-aware requires
 scoping the cache key first.
+
+**One exception to the heading, and it cuts the other way.** `/taxon_category/` does not use
+`subQuery` at all — it hand-assembles its own chain and skips `DecorateQuery`, so it is not
+public-only, it is **unfiltered**. See item 2 of "Five defects found during this work" below.
+The `subQuery` doc comment in `routes/dataRouter.js` says "ALL /data/* COUNTS ARE
+PUBLIC-DATA-ONLY"; read that as scoped to `subQuery`'s three consumers, which is where it
+sits.
 
 #### `join()` identity, and the two expanders that differ
 
@@ -218,6 +263,73 @@ the process. That is fixed, but the trap moved rather than vanished: with the gu
 `middleware/CrossCollectionSource.js` was the one caller doing this, so **every
 cross-collection download whose source filter contained `join()`/`GenomeGroup()`/
 `FeatureGroup()` was broken**; it now threads the real `req`. Any new caller must too.
+
+#### Five defects found during this work and deliberately NOT fixed
+
+Each was found while auditing the self-call sites, each is out of the branch's scope, and
+each was re-verified against the code on 2026-08-27. They are recorded here because the
+next person to touch these files needs to know, and because two of them are worse than
+their one-line descriptions suggest.
+
+**1. `rpc/proteinFamily.js`'s `pfs_` cache serves one user's private genome to the next.**
+This is the one to fix first. `fetchFamilyDataByGenomeId` (`:96`) keys Redis on
+`'pfs_' + genomeId` with **no user scoping**, while the fetch that populates it forwards
+`options.token` (`:114`) and therefore runs permission-scoped. So the cache is written with
+one identity and read with any other, for a 24-hour TTL:
+
+- owner requests a private genome → `pfs_<id>` holds its `pgfam_id`/`plfam_id`/`figfam_id`/
+  `aa_length` rows → any anonymous caller asking for the same `genomeId` reads them back;
+- and in the other direction, an anonymous request caches the empty public answer, after
+  which the owner gets zero rows for their own genome until the TTL expires.
+
+This is the **identical shape** as the enrichment leak under "Permission scoping" below —
+process-wide cache, unscoped key — which is documented there as a real, live cross-user
+read that was fixed. The fix is the same: prefix the key with `permissionScopeKey()` from
+`lib/permissionFilter.js`. It is deferred only because it sits behind the RPC identity model
+(item 3), not because it is theoretical. Note the RPC endpoint is unauthenticated at the
+route level, so no login is needed to read a warm cache.
+
+`fetchFamilyDescriptionBatch`'s cache (`:22,:53`, keyed on bare `family_id`) is **fine** and
+should not be "fixed" alongside it: `protein_family_ref` is public reference data and that
+fetch sends no `Authorization` at all.
+
+**2. `routes/dataRouter.js:217` (`/taxon_category/`) queries `genome` with no permission
+filter whatsoever.** It hand-assembles `RQLQueryParser → APIMethodHandler → media`, skipping
+both `DecorateQuery` and `PublicDataTypes`. It returns only the *keys* of the
+superkingdom/order/family facets, so this discloses the taxonomic names present among
+private genomes rather than any row content — much milder than item 1, but it is the one
+`/data` endpoint where "public-data-only" (see above) is not merely a limitation but an
+unenforced one. It is also the only `/data` route with no `cacheWithRedis`, which is why it
+has no cache-key problem of its own.
+
+**3. `routes/rpcHandler.js:25` is a dead auth gate.** It tests `methodDef.requireAuth`;
+all six RPC modules declare **`requireAuthentication`** (verified: `biosetResult:153`,
+`cluster:107`, `msa:231`, `panaconda:63`, `proteinFamily:237`, `transcriptomicsGene:349`).
+The property never matches, so the 401 has never fired. Harmless *today* only because every
+method declares `false` — the hazard is that setting one to `true` looks like it enforces
+authentication and silently does not. Fix the name and the declarations together, or delete
+the gate; leaving it is the worst of the three options.
+
+**4. The RPC identity model is client-supplied, which is why those 10 sites are deferred.**
+`app.js:144` is `app.post('/', rpcHandler)` with **no auth middleware** — verified, there is
+no global one either — so `req.user` is always `undefined` inside RPC. The real identity is
+`params[1].token`, forwarded as an `Authorization` header on the inner self-call and
+validated only by that self-call's own chain. Converting these to `internalQuery` naively
+would drop the token and break private workspace transcriptomics; doing it properly means
+validating the token at the RPC boundary first. That is a design change, not a transport
+change.
+
+**5. `util/featureSequence.js:24` `_getSequenceDictByHash` is dead code.** Defined, never
+exported (`module.exports` at `:84` lists only `getSequenceByHash` and
+`getSequenceDictByHash`), never called anywhere in the tree. Its self-call at `:29` is
+therefore unreachable, unlike `getSequenceByHash`'s at `:12`, which is live. Worth deleting
+rather than auditing.
+
+One incidental payoff of step 7 worth knowing: `rpc/proteinFamily.js:7` gives its self-calls
+an agent with **`maxSockets: 1`** — literally the configuration the queue-wait test models.
+Concurrent RPC calls serialize behind that one socket, and before `3fc64ead` the queued ones
+had no deadline of any kind. They now inherit the `util/http.js` wall-clock deadline even
+though the site itself is unconverted.
 
 ### Facet counts cannot be corrected inside Solr
 

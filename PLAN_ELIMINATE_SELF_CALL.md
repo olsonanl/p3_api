@@ -1,6 +1,6 @@
 # feature/eliminate-self-call — remove HTTP self-calls from the hot path
 
-## STATUS (2026-08-26) — steps 1–7 done; only the step-8 doc pass remains
+## STATUS (2026-08-27) — all 8 steps done; branch is code complete and unpushed
 
 Branch `feature/eliminate-self-call`, based on `6397c6cf` (master).
 
@@ -13,7 +13,7 @@ upstream" and that is wrong. The two remotes are `origin`
 |---|---|
 | `origin/feature/eliminate-self-call` | `797adf86` |
 | `bob/feature/eliminate-self-call` | `ee4c56b8` (4 behind origin) |
-| local `HEAD` | the step-6 doc commit, **8 ahead of origin** — `git log --oneline 797adf86..HEAD` |
+| local `HEAD` | the step-8 doc commit, **11 ahead of origin** — `git log --oneline 797adf86..HEAD` |
 
 | step | state | commit |
 |---|---|---|
@@ -24,10 +24,32 @@ upstream" and that is wrong. The two remotes are `origin`
 | 5. Convert `dataRouter` | **done** — also fixes a production abort | `31a1d5ad` |
 | 6. Convert `ExpandingQuery` | **done** — also fixes a second production abort | `6b1335e4` |
 | 7. `util/http.js` wall-clock deadline | **done** — closes both outbound-timeout gaps | `3fc64ead` |
-| 8. `CLAUDE.md` pass | partially done in `43212317`, `649f1bab`, and step 7's follow-up | — |
+| 8. `CLAUDE.md` pass | **done** — the five deferred findings, plus four corrections | see below |
 
-**All code steps are complete.** What remains is documentation and the maintainer decision
-in "Open question" below.
+**The branch is complete.** What remains is not work on this plan: the maintainer decision in
+"Open question" below, and pushing — nothing has been pushed to either remote.
+
+Step 8 was not only additive. Writing the five deferred findings down meant re-verifying them
+against the code, and four claims in `CLAUDE.md` did not survive that:
+
+- **The RPC self-call count is 10, not 9.** `grep -rn "get('http_port')" rpc/` gives
+  `transcriptomicsGene` 4, `proteinFamily` 2, `biosetResult` 2, `msa` 1, `panaconda` 1.
+  Corrected in both documents.
+- **"pushed to `upstream`" was wrong in `CLAUDE.md` too** — this file had already been
+  corrected, that one had not. There is no such remote.
+- **"All `/data/*` counts are public-data-only" is not true of `/taxon_category/`,** which
+  skips `DecorateQuery` entirely and is therefore unfiltered rather than public-only. The
+  heading now carries the exception.
+- **`rpc/transcriptomicsGene.js:146` belongs on the `JSON.parse` hazard list** and was
+  missing from it. It is a third sub-pattern — a `catch` that rejects **without returning**,
+  inside an async Promise executor — and it is the one deferred site with a confirmed live
+  abort, observed during step 7's test runs.
+
+The most consequential finding is item 1 of the five: `rpc/proteinFamily.js`'s `pfs_<genomeId>`
+Redis cache is **not user-scoped** while the fetch that fills it forwards the caller's token,
+so it serves one user's private genome data to the next for 24 hours. Same shape as the
+enrichment leak fixed in `PLAN_ENRICHMENT_PERMISSIONS.md`. Deferred with the RPC sites, but it
+is a live cross-user read, not a latent one — worth its own branch ahead of the RPC conversion.
 
 **Everything after `797adf86` is local only** — `c868a061`, `73e5d2a3`, `c42d88a0`,
 `31a1d5ad`, `43212317` (docs), `6b1335e4` (step 6), `649f1bab` (docs), `3fc64ead` (step 7),
@@ -40,7 +62,7 @@ still matching `grep -rn "get('http_port')" --include=*.js`:
 | site | why it is still there |
 |---|---|
 | `app.js:43` | the real `listen`, not a self-call |
-| `rpc/{msa,biosetResult,proteinFamily,panaconda,transcriptomicsGene}.js` (9) | deliberately deferred — see "RPC identity model" below |
+| `rpc/{msa,biosetResult,proteinFamily,panaconda,transcriptomicsGene}.js` (**10**, not 9 — the grep was miscounted; `transcriptomicsGene` has 4) | deliberately deferred — see "RPC identity model" below |
 | `bundler/genome.js:10` | not reached from the data path; never appeared in the traffic analysis |
 | `util/featureSequence.js:12,29` | `:29` is dead code (not exported); `:12` is a live one-shot lookup, unassessed |
 
@@ -379,7 +401,7 @@ deadlock hazard; and make sub-query failures visible instead of rendering as suc
 
 ### Scope (decided)
 
-**Hot path only.** Three sites: `multiQuery`, `dataRouter`, `ExpandingQuery`. The 9 RPC
+**Hot path only.** Three sites: `multiQuery`, `dataRouter`, `ExpandingQuery`. The 10 RPC
 sites, the `media`/`featureSequence` sites, and `bundler/genome.js` are deferred to a
 follow-up branch — the RPC ones carry a distinct hazard (identity comes from
 client-supplied `params[1].token`, not `req`) that deserves its own review.
@@ -669,9 +691,29 @@ even though its per-request cost is not separately visible in the log.
   so any `join()`/`GenomeGroup()`/`FeatureGroup()` term throws a TypeError there today.
   Verified. Fix while in this code.
 
-### Documented-but-not-fixed
+### Documented-but-not-fixed — DONE (step 8)
 
-Per decision, record these in `CLAUDE.md` (or `Docs/`) without changing them:
+All five are now written up in `CLAUDE.md` under **"Five defects found during this work and
+deliberately NOT fixed"**, re-verified against the code on 2026-08-27. Two came out of that
+re-verification worse than the one-line descriptions below, and the write-up reflects that
+rather than these:
+
+- **Item 5 is a live cross-user private-data read**, not merely an unscoped cache. The key is
+  `'pfs_' + genomeId` while the fetch forwards `options.token`, so it is written under one
+  identity and read under any other for a 24-hour TTL — in both directions (owner leaks to
+  anonymous; anonymous poisons the owner with an empty answer). The sibling
+  `family_id` cache in the same file is genuinely fine and should not be changed with it.
+- **Item 2's blast radius is narrower than "no permission filter" suggests** — the endpoint
+  returns only facet *keys*, so it discloses the taxonomic names present among private
+  genomes, not row content. Worth stating precisely so nobody triages it above item 5.
+
+Also corrected while writing them up: the RPC site count (10, not 9), a stale "pushed to
+`upstream`" in `CLAUDE.md`, the blanket "all `/data/*` counts are public-data-only" claim
+(`/taxon_category/` is unfiltered, not public-only), and a missing entry on the `JSON.parse`
+hazard list — `rpc/transcriptomicsGene.js:146`, a `catch` that rejects without returning
+inside an async Promise executor, and the one deferred site with a confirmed live abort.
+
+The original terse list, for provenance:
 
 1. **`routes/rpcHandler.js:25`** — guard reads `methodDef.requireAuth`; every method
    declares `requireAuthentication` (verified). The 401 gate has never fired. Harmless
@@ -824,7 +866,8 @@ individually. `lib/internalQuery.js` is additive and inert until a caller uses i
    cross-collection-download break.
 7. ~~Wall-clock deadline in `util/http.js` (see Scope).~~ **DONE (`3fc64ead`).** Landed last,
    though it was independent of the conversions and could have gone any time after step 1.
-8. `CLAUDE.md` documentation pass. **← the only step left.**
+8. ~~`CLAUDE.md` documentation pass.~~ **DONE.** Turned up four wrong claims in `CLAUDE.md`
+   on re-verification — see the step-8 note in STATUS.
 
 **Deploy note:** let master soak in production before stacking this on top. #202 was
 deployed once and rolled back, so the current master has not had a clean production run.
