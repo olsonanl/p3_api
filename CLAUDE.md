@@ -573,6 +573,11 @@ This bug only bites where `distributedQuery.enabled` is true. Production sets it
 limit to `idCount + 10`, dropping it below `minLimitThreshold` (10000). `feature_sequence` is
 likewise immune because it is not in `enabledCollections`.
 
+`terms()` used to be the exception that let a user-sized filter through; as of the
+`detectFixedIdCount` change it is capped the same way, so **nothing in normal use reaches this
+code path with a large filter any more**. That makes the gate below the only thing holding the
+regression down — do not delete it on the grounds that the bug is unreachable.
+
 Gate: `tests/test-distributed/test.shardcursor-post.spec.js` (9 tests, fully offline against a
 stub Solr; all 9 fail against the pre-change module).
 
@@ -1208,7 +1213,8 @@ every matching doc). The hash set is close to a wash against Lucene's own boolea
 
 Practical consequence: **the same benefit is available to `in()`** by emitting it into `fq`
 when the query needs no scoring — a cheaper change than pushing callers onto a second
-operator, and it would keep `Limiter.detectFixedIdCount` working (see below). Not implemented.
+operator. Not implemented. Note that `detectFixedIdCount` would need the matching pattern
+change in the same commit, exactly as it did for `terms()` (see below).
 
 #### Vacating `q=` is the real cost — hence `cache=false`
 
@@ -1279,7 +1285,10 @@ sends `limit(25000)` on every `query_cb` (`chunk_size`). So:
 
 - `in()` is caught by `Limiter.detectFixedIdCount` and capped to `rows = idCount + 10` — below
   `minLimitThreshold` (10000) — and takes the **standard** path.
-- `terms()` is invisible to that regex, keeps `rows=25000`, and takes the **distributed** path.
+- `terms()` was invisible to that regex, kept `rows=25000`, and took the **distributed** path.
+
+**Fixed** — `detectFixedIdCount` now recognizes both forms and the two operators get identical
+`rows`; see "`detectFixedIdCount` sees both operators" below.
 
 The two operators were never running on the same transport. Confirmed on their own endpoint:
 with `rows` held equal, `terms()` is faster there too (0.88× / 0.47× / 0.44× at n=100/500/1500);
@@ -1295,17 +1304,41 @@ lists (min-of-3 wall ms, scattered `feature_id`, `limit(n)`): 100 → 117 vs 51,
 158, 1500 → 680 vs 355, 5000 → 2696 vs 931. Scattering the ids *widens* the gap in `terms()`'s
 favour, which is the expected direction — a boolean rewrite pays per-term dictionary seeks.
 
-So before trusting any A/B of these two operators, check both of the above: the silent `rows`
-divergence and `distributedQuery.enabled`. Also note a best-of-N harness that reuses **one** id
-list lets runs 2..N hit the filterCache, which flatters `terms()` — that design can only
-understate a `terms()` loss, never invent one.
+Also note a best-of-N harness that reuses **one** id list lets runs 2..N hit the filterCache,
+which flatters `terms()` — that design can only understate a `terms()` loss, never invent one.
 
-Note the interaction with the distributed path. `terms()` is invisible to
-`Limiter.detectFixedIdCount`, whose regex matches `in()`'s `field:(a OR b)` output but not
-`{!terms f=field}`. So an `in()` query gets its limit capped to `idCount + 10` and drops below
-`minLimitThreshold`, while the equivalent `terms()` query keeps its large limit and **engages
-the distributed path**. That difference is what exposed the 8 KB shard-fetch ceiling — see
-"Shard pages are POSTs" above.
+#### `detectFixedIdCount` sees both operators
+
+`middleware/Limiter.js` recognizes both id-list forms and caps `rows` to `idCount + 10` for
+either:
+
+```
+in(pk,(a,b,c))     -> q= ... (pk:(a OR b OR c))
+terms(pk,(a,b,c))  -> &fq={!terms f=pk cache=false}a,b,c
+```
+
+Verified end to end (RQL → `toSolr` → `Limiter`, `genome_feature`, `limit(25000)`): at
+n=100/1500/9000/15000 both operators now emit `rows` of 110/1510/9010/15010, so both stay on
+the standard path below 15000 and both cross `minLimitThreshold` at 15000. Previously `terms()`
+held `rows=25000` at every size.
+
+Three things about the detection worth preserving:
+
+- **It is anchored to `&fq=`.** Only an `fq` is unconditionally ANDed, so only there does the
+  value count bound the result set. The `in()` pattern has no such anchor and will happily
+  match inside an `or()`, where the count bounds nothing — a **pre-existing** looseness that
+  the terms pattern deliberately does not copy.
+- **It skips a filter carrying a `separator` local param** rather than comma-counting it. The
+  emitter never sets one; skipping leaves `rows` uncapped, which is the safe direction.
+- **`cache=false` is optional to the match.** Other emitters and captured queries predate it.
+
+Note this is what exposed the 8 KB shard-fetch ceiling — a `terms()` query used to be the only
+way a user-sized `in`-style filter reached the distributed path. It no longer is, so
+`tests/test-distributed/test.shardcursor-post.spec.js` is now the only thing holding that
+regression down; see "Shard pages are POSTs" above.
+
+Gate: `tests/test-util/test.limiter-terms.spec.js` (13 tests, offline; 8 fail against the
+pre-change middleware, and the 5 that pass are the negative cases).
 
 ## Cross-Collection Joins and Query Safety
 
