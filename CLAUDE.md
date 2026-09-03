@@ -1185,6 +1185,61 @@ in(genome_id,(123.456,789.012,345.678))
 
 Use `terms()` instead of `in()` when the value list is large. The `terms()` output goes into an `&fq=` parameter (cached by Solr's filter cache) rather than into the main `&q=` query.
 
+#### The win is `fq` vs `q`, not hash-set vs boolean
+
+The rationale above ("hash-set filter beats the boolean OR tree") is **mostly wrong about the
+mechanism**, though the conclusion holds. Measured 2026-09-03 against the production cluster,
+direct to Solr, POST, **`rows` held constant** and a **fresh id list per repetition** so
+nothing hits the filterCache (min-of-3 QTime ms, `genome_feature`/`feature_id`):
+
+| n | `in()` → `q=` bool | `{!terms}` → `fq=` | `{!terms cache=false}` → `fq=` | bool → `fq=` |
+|---|---|---|---|---|
+| 100 | 47 | 33 | 50 | 32 |
+| 500 | 152 | 71 | 71 | 80 |
+| 1500 | 299 | 169 | 158 | 172 |
+| 5000 | 925 | 479 | 393 | 357 |
+
+Read the last column against the second: a **boolean OR in `fq` is as fast as `{!terms}`**, and
+at n=5000 it is faster. Nearly all of `terms()`'s advantage over `in()` comes from the clause
+landing in `fq` (a filter, unscored, no `maxScore` bookkeeping) instead of `q` (scored across
+every matching doc). The hash set is close to a wash against Lucene's own boolean rewrite.
+
+Practical consequence: **the same benefit is available to `in()`** by emitting it into `fq`
+when the query needs no scoring — a cheaper change than pushing callers onto a second
+operator, and it would keep `Limiter.detectFixedIdCount` working (see below). Not implemented.
+
+#### `terms()` is not slower on small lists
+
+An external report (BLAST database build, against alpha) measured `terms()` **2.3× slower at
+n=100** and slower up to a crossover of ~5k values, and hypothesized per-request overhead in
+the `fq` construction. **Not reproduced.** Through the API on this cluster `terms()` is faster
+at every size tested, on both `genome_feature`/`feature_id` and `feature_sequence`/`md5`, at
+both `limit(n)` and `limit(25000)`, with contiguous *and* scattered id lists (min-of-3 wall ms,
+scattered `feature_id`, `limit(n)`): 100 → 117 vs 51, 500 → 342 vs 158, 1500 → 680 vs 355,
+5000 → 2696 vs 931. Scattering the ids *widens* the gap in `terms()`'s favour, which is the
+expected direction — a boolean rewrite pays per-term dictionary seeks.
+
+Two things to check before trusting an A/B of these operators, both of which make the
+comparison not like-for-like and both of which live in our code, not Solr's:
+
+- **The `Limiter` cap below is silent.** `in()` gets `rows` capped to `idCount + 10`; `terms()`
+  keeps whatever the client asked for. A `limit(25000)` with 100 ids runs at `rows=110` for
+  one operator and `rows=25000` for the other.
+- **`distributedQuery.enabled`.** On an enabled collection past `minLimitThreshold`, `terms()`
+  engages the distributed path and `in()` (capped below the threshold) does not — so the two
+  run on entirely different transports. Production and this dev config both set `enabled:
+  false`, so the runs above are standard-path on both sides; a deployment with it on is not
+  comparable to them.
+
+Also note a best-of-N harness that reuses **one** id list lets runs 2..N hit the filterCache,
+which flatters `terms()` — so that design cannot explain a `terms()` loss, only understate one.
+
+`terms()` filters are emitted **without `cache=false`**, so every one-shot id list is inserted
+into the filterCache. The table above suggests that costs ~5–18% at n ≥ 1500 and pollutes the
+cache for lists that will never be seen again. A repeat-query test meant to price the other
+side of that trade (paging a grid re-sends the same filter) was **too noisy to call** on a
+cluster carrying live load. Left as-is pending a measurement on a quiet cluster.
+
 Note the interaction with the distributed path. `terms()` is invisible to
 `Limiter.detectFixedIdCount`, whose regex matches `in()`'s `field:(a OR b)` output but not
 `{!terms f=field}`. So an `in()` query gets its limit capped to `idCount + 10` and drops below
