@@ -575,30 +575,44 @@ likewise immune because it is not in `enabledCollections`.
 Gate: `tests/test-distributed/test.shardcursor-post.spec.js` (9 tests, fully offline against a
 stub Solr; all 9 fail against the pre-change module).
 
-### Known defect: sorted distributed results are misordered
+### The merge comparator must match Solr's byte order, not ICU collation
 
-**`lib/distributed/MinHeap.js:246` compares strings with `localeCompare`** — ICU collation —
-while Solr sorts strings by **UTF-8 byte order**. The two disagree on case: ICU orders by base
-letter, so `misc_feature` sorts before `misc_RNA`, whereas Solr puts `misc_RNA` first (`R`
-0x52 < `f` 0x66). Each shard arrives correctly sorted; `MergeSortStream`'s k-way merge then
-interleaves them wrongly.
+**`MinHeap.compareUtf8` exists because `localeCompare` silently misordered sorted distributed
+results.** Solr sorts string fields on their indexed BytesRef, which Lucene compares as
+**unsigned UTF-8 bytes**. `localeCompare` is ICU collation and orders by base letter, ignoring
+case at the primary level, so the two disagree: ICU puts `misc_feature` before `misc_RNA`,
+Solr puts `misc_RNA` first (`R` 0x52 < `f` 0x66).
 
-Observed on a live sorted distributed query: `sort(+feature_id)&limit(25000)` returned **7
-out-of-order positions** in 25,000 rows, against a standard-path response that was
-monotonic. Offline proof:
+That only matters because each shard arrives **already sorted by Solr** — `MergeSortStream`'s
+k-way merge is only correct if its comparator agrees with the order its inputs came in.
+Disagreement interleaves correctly-sorted shards into a wrongly-ordered output. A live
+`sort(+feature_id)&limit(25000)` returned **7 out-of-order positions** in 25,000 rows against
+a monotonic standard-path response.
 
-```bash
-node -e 'const M=require("./lib/distributed/MinHeap");
-const c=M.multiFieldComparator([{field:"f",order:"asc"}]);
-console.log(c({f:"misc_feature"},{f:"misc_RNA"}),   // -1  (ICU)
-            Buffer.compare(Buffer.from("misc_feature"),Buffer.from("misc_RNA")))'  // 1 (Solr)
-```
+Anything comparing sort-field values must go through `MinHeap.compareUtf8`. It is not simply
+`Buffer.compare`: JS `<` is UTF-16 code-unit order, which is *identical* to UTF-8 byte order
+for any string without a surrogate pair, so the common case is handled natively and only
+strings carrying a supplementary character fall back to an explicit byte compare. That
+matters — `Buffer.compare` on every comparison measured **10× slower than the `localeCompare`
+it replaces** (1071 vs 107 ns), while the guarded form is 123 ns, i.e. free. The fallback is
+not decorative: UTF-8 sorts supplementary characters above all BMP code points, whereas their
+UTF-16 surrogates (0xD800–0xDBFF) fall below the 0xE000–0xFFFF range, so plain `<` gets emoji
+vs. private-use characters backwards.
 
-**Pre-existing and independent of the POST conversion** — it reproduces with a filter far
-under the 8 KB ceiling, and the reordering happens after documents leave `ShardCursorStream`.
-Not fixed here because it changes shared-path ordering and deserves its own change: the fix is
-to compare with `Buffer.compare`/`<` rather than `localeCompare`, and `tests/test-distributed/
-test.minheap.spec.js` will need review since it may encode the current behavior.
+Verified live after the fix, distributed vs standard path, **byte-identical documents** in
+every case: `sort(+feature_id)`, `sort(+feature_type)` (the field carrying the
+`misc_RNA`/`misc_feature` collision), `sort(+product)` (free text), a descending sort, and a
+3000-id `terms()` filter combined with a mixed-case sort. Each previously had out-of-order
+positions or, for the last, failed outright.
+
+Gate: the `compareUtf8` and mixed-case cases in `tests/test-distributed/test.minheap.spec.js`
+(6 tests, offline; all 6 fail against the pre-change comparator, and the 23 pre-existing tests
+in that file pass either way — none of them encoded the ICU behavior).
+
+Note this fix does **not** touch missing-value ordering. `fieldComparator` sorts
+`null`/`undefined` last on ascending, which is Solr's `sortMissingLast` behavior but not its
+universal default; if a sorted distributed query ever disagrees with the standard path on rows
+missing the sort field, that is where to look.
 
 ## Trace Replay & Shakedown Testing
 
