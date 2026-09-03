@@ -543,6 +543,63 @@ curl -X POST http://localhost:3001/test/distributed-query \
 
 The distributed query system requires direct network access to all Solr shard replicas. If some hosts are inaccessible, use `excludeNodes` to filter them out. Each shard must have at least one accessible replica.
 
+### Shard pages are POSTs — do not convert them back to GET
+
+`ShardCursorStream` sends each cursor page as a **POST with a form-encoded body**. It was the
+last GET in the subsystem carrying a user-sized filter, and that broke `terms()`:
+
+- An RQL `terms()`/`in()` clause over a few hundred feature ids crosses Jetty's default
+  **`requestHeaderSize` of 8192 bytes**. The shard answers **`414 URI Too Long`**.
+- The client sees **HTTP 200 with a one-byte body, `[`** — `media/json.js` writes the opening
+  bracket before the first document arrives, so no mid-stream shard failure can change the
+  status code. Same empty-200-on-failure class as the streaming-`sort()` and shard-failure
+  defects documented elsewhere in this file.
+- Measured ceiling ≈ **148 feature ids** (~55 bytes each). Verified after the fix: 3000 ids,
+  a **166 KB** `fq` (~20× the old ceiling), returns 2,338,240 bytes byte-identical to the
+  standard path.
+
+Two traps if you touch `_buildQueryParams`:
+
+- **Parse the caller's fragment, don't concatenate it.** `URLSearchParams` decodes it exactly
+  as Solr decodes a query string (`+`→space, `%XX`→byte) and re-encodes it for the body, so
+  Solr local params like `{!terms f=x}` and values containing spaces survive intact.
+- **`append()`, not `set()`, for caller params, and only default `q=*:*` when the caller has
+  none.** Repeated `fq=` must all survive, and an unconditional `q=*:*` produces a duplicate
+  `q=` and an empty result set when the RQL constraint landed in `q=` rather than `fq=`.
+
+This bug only bites where `distributedQuery.enabled` is true. Production sets it `false`, and
+`in()` never reached the path at all — `Limiter.detectFixedIdCount` caps a fixed-id query's
+limit to `idCount + 10`, dropping it below `minLimitThreshold` (10000). `feature_sequence` is
+likewise immune because it is not in `enabledCollections`.
+
+Gate: `tests/test-distributed/test.shardcursor-post.spec.js` (9 tests, fully offline against a
+stub Solr; all 9 fail against the pre-change module).
+
+### Known defect: sorted distributed results are misordered
+
+**`lib/distributed/MinHeap.js:246` compares strings with `localeCompare`** — ICU collation —
+while Solr sorts strings by **UTF-8 byte order**. The two disagree on case: ICU orders by base
+letter, so `misc_feature` sorts before `misc_RNA`, whereas Solr puts `misc_RNA` first (`R`
+0x52 < `f` 0x66). Each shard arrives correctly sorted; `MergeSortStream`'s k-way merge then
+interleaves them wrongly.
+
+Observed on a live sorted distributed query: `sort(+feature_id)&limit(25000)` returned **7
+out-of-order positions** in 25,000 rows, against a standard-path response that was
+monotonic. Offline proof:
+
+```bash
+node -e 'const M=require("./lib/distributed/MinHeap");
+const c=M.multiFieldComparator([{field:"f",order:"asc"}]);
+console.log(c({f:"misc_feature"},{f:"misc_RNA"}),   // -1  (ICU)
+            Buffer.compare(Buffer.from("misc_feature"),Buffer.from("misc_RNA")))'  // 1 (Solr)
+```
+
+**Pre-existing and independent of the POST conversion** — it reproduces with a filter far
+under the 8 KB ceiling, and the reordering happens after documents leave `ShardCursorStream`.
+Not fixed here because it changes shared-path ordering and deserves its own change: the fix is
+to compare with `Buffer.compare`/`<` rather than `localeCompare`, and `tests/test-distributed/
+test.minheap.spec.js` will need review since it may encode the current behavior.
+
 ## Trace Replay & Shakedown Testing
 
 `scripts/replay-queries.js` replays captured real-user API traces against a dev server and deep-diffs each response against the recorded original. It was moved into this module (it originated in the web module) because the queries it exercises are the API's responsibility. It was the primary tool used to shake down the `feature/distributed-query` branch — full findings in `Docs/DISTRIBUTED_QUERY_SHAKEDOWN.md`.
@@ -1113,6 +1170,13 @@ in(genome_id,(123.456,789.012,345.678))
 ```
 
 Use `terms()` instead of `in()` when the value list is large. The `terms()` output goes into an `&fq=` parameter (cached by Solr's filter cache) rather than into the main `&q=` query.
+
+Note the interaction with the distributed path. `terms()` is invisible to
+`Limiter.detectFixedIdCount`, whose regex matches `in()`'s `field:(a OR b)` output but not
+`{!terms f=field}`. So an `in()` query gets its limit capped to `idCount + 10` and drops below
+`minLimitThreshold`, while the equivalent `terms()` query keeps its large limit and **engages
+the distributed path**. That difference is what exposed the 8 KB shard-fetch ceiling — see
+"Shard pages are POSTs" above.
 
 ## Cross-Collection Joins and Query Safety
 
